@@ -1,0 +1,12 @@
+[project]
+name = "presentation-generator"
+version = "0.1.0"
+description = "Extract slides as PNG images and speaker notes from PowerPoint presentations"
+requires-python = ">=3.8"
+dependencies = [
+    "comtypes>=1.4.0",
+    "python-pptx>=0.6.21",
+]
+
+[tool.uv]
+dev-dependencies = []
