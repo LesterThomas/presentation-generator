@@ -90,19 +90,30 @@ def export_slides_as_png(pptx_path: Path, output_folder: Path) -> int:
         slide_count = presentation.Slides.Count
         logger.info(f"Found {slide_count} slides")
         
-        # Export each slide as PNG
+        # Export each slide as PNG (skip hidden slides)
+        visible_slide_num = 0
         for i in range(1, slide_count + 1):
             try:
                 slide = presentation.Slides(i)
-                output_file = output_folder / f"slide_{i:02d}.png"
                 
-                logger.info(f"Exporting slide {i}/{slide_count} to {output_file.name}")
+                # Check if slide is hidden
+                try:
+                    if slide.SlideShowTransition.Hidden:
+                        logger.info(f"Skipping hidden slide {i}")
+                        continue
+                except:
+                    pass  # If we can't check, assume it's visible
+                
+                visible_slide_num += 1
+                output_file = output_folder / f"slide_{visible_slide_num:02d}.png"
+                
+                logger.info(f"Exporting slide {i} as slide {visible_slide_num}/{slide_count} to {output_file.name}")
                 slide.Export(str(output_file.resolve()), "PNG")
                 
             except Exception as e:
                 logger.error(f"Failed to export slide {i}: {e}")
         
-        logger.info("Slide export completed")
+        logger.info(f"Slide export completed - exported {visible_slide_num} visible slides")
         
     except Exception as e:
         logger.error(f"Error during PowerPoint automation: {e}")
@@ -124,41 +135,54 @@ def export_slides_as_png(pptx_path: Path, output_folder: Path) -> int:
         except Exception as e:
             logger.error(f"Error quitting PowerPoint: {e}")
     
-    return slide_count
+    return visible_slide_num
 
 
 def extract_speaker_notes(pptx_path: Path, output_folder: Path, slide_count: int) -> None:
     """
-    Extract speaker notes from each slide and save as text files.
+    Extract speaker notes from each visible slide and save as text files.
+    Skips hidden slides.
     
     Args:
         pptx_path: Path to the PowerPoint file
         output_folder: Path to the output folder
-        slide_count: Number of slides in the presentation
+        slide_count: Expected number of visible slides
     """
     try:
         logger.info("Extracting speaker notes...")
         prs = Presentation(str(pptx_path))
         
+        visible_slide_num = 0
         for i, slide in enumerate(prs.slides, start=1):
             try:
+                # Check if slide is hidden using the underlying XML
+                try:
+                    if hasattr(slide, '_element') and hasattr(slide._element, 'show'):
+                        if slide._element.show == 0:
+                            logger.info(f"Skipping hidden slide {i} for notes extraction")
+                            continue
+                except:
+                    pass  # If we can't check, assume it's visible
+                
+                visible_slide_num += 1
+                
                 # Get speaker notes
                 notes_slide = slide.notes_slide
                 notes_text = notes_slide.notes_text_frame.text if notes_slide else ""
                 
                 # Save to text file
-                output_file = output_folder / f"text_{i:02d}.txt"
+                output_file = output_folder / f"text_{visible_slide_num:02d}.txt"
                 output_file.write_text(notes_text, encoding='utf-8')
                 
                 if notes_text.strip():
-                    logger.info(f"Extracted notes for slide {i}/{slide_count}")
+                    logger.info(f"Extracted notes for slide {i} as text_{visible_slide_num:02d}.txt")
                 else:
-                    logger.info(f"No notes found for slide {i}/{slide_count}")
+                    logger.info(f"No notes found for slide {i} (text_{visible_slide_num:02d}.txt)")
                     
             except Exception as e:
                 logger.error(f"Failed to extract notes for slide {i}: {e}")
         
-        logger.info("Speaker notes extraction completed")
+        logger.info(f"Speaker notes extraction completed - processed {visible_slide_num} visible slides")
         
     except Exception as e:
         logger.error(f"Error reading presentation for notes: {e}")
@@ -168,6 +192,7 @@ def extract_speaker_notes(pptx_path: Path, output_folder: Path, slide_count: int
 def generate_audio_from_notes(output_folder: Path, slide_count: int) -> None:
     """
     Generate audio files from speaker notes text files using csm-voice tool.
+    Caches audio files to avoid regeneration if text hasn't changed.
     
     Args:
         output_folder: Path to the output folder containing text files
@@ -180,7 +205,19 @@ def generate_audio_from_notes(output_folder: Path, slide_count: int) -> None:
             text_file = f"text_{i:02d}.txt"
             audio_file = f"audio_{i:02d}.wav"
             
+            text_path = output_folder / text_file
+            audio_path = output_folder / audio_file
+            
             try:
+                # Check if audio already exists and is newer than text file
+                if audio_path.exists():
+                    audio_mtime = audio_path.stat().st_mtime
+                    text_mtime = text_path.stat().st_mtime
+                    
+                    if audio_mtime > text_mtime:
+                        logger.info(f"Audio {i}/{slide_count} already exists and is up-to-date, reusing...")
+                        continue
+                
                 logger.info(f"Processing {text_file} -> {audio_file}")
                 
                 # Set up environment with UTF-8 encoding for csm-voice
@@ -229,7 +266,7 @@ def create_individual_clips(output_folder: Path, slide_count: int) -> list:
         List of paths to created video clips
     """
     try:
-        from moviepy import ImageClip, AudioFileClip
+        from moviepy import ImageClip, AudioFileClip, CompositeAudioClip
         
         logger.info("Creating individual video clips...")
         
@@ -258,8 +295,14 @@ def create_individual_clips(output_folder: Path, slide_count: int) -> list:
                 logger.info(f"Creating video clip {i}/{slide_count}...")
                 
                 audio = AudioFileClip(str(audio_file))
-                image = ImageClip(str(image_file)).with_duration(audio.duration)
-                video = image.with_audio(audio)
+                # Add 1 second pause at the start of each slide
+                # Set audio to start 1 second into the clip
+                audio_delayed = audio.with_start(1.0)
+                # Create composite with just the delayed audio
+                composite_audio = CompositeAudioClip([audio_delayed])
+                # Image duration is audio duration + 1 second pause
+                image = ImageClip(str(image_file)).with_duration(audio.duration + 1.0)
+                video = image.with_audio(composite_audio)
                 
                 video.write_videofile(
                     str(clip_file),
