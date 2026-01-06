@@ -6,6 +6,8 @@ requires-python = ">=3.8"
 dependencies = [
     "comtypes>=1.4.0",
     "python-pptx>=0.6.21",
+    "moviepy>=1.0.3",
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 [tool.uv]

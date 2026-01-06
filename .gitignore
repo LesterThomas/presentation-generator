@@ -51,6 +51,7 @@ Test Presentation/
 *.png
 *.wav
 *.txt
+*.mp4
 !pyproject.toml
 !extract_slides.py
 !.gitignore

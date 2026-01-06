@@ -32,6 +32,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Video configuration (adjust for quality vs speed tradeoff)
+VIDEO_CONFIG = {
+    'fps': 24,             # Frames per second (24 is standard for video, even with static images)
+    'codec': 'libx264',    # Video codec
+    'audio_codec': 'aac',  # Audio codec
+    'preset': 'ultrafast', # Encoding speed: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+    'bitrate': '1000k',    # Video bitrate (higher = better quality, larger file)
+}
+
+
 def setup_output_folder(pptx_path: Path) -> Path:
     """
     Create output folder with the same name as the presentation.
@@ -206,6 +216,152 @@ def generate_audio_from_notes(output_folder: Path, slide_count: int) -> None:
         raise
 
 
+def create_individual_clips(output_folder: Path, slide_count: int) -> list:
+    """
+    Create individual video clips for each slide (image + audio).
+    Caches clips to avoid regenerating if files haven't changed.
+    
+    Args:
+        output_folder: Path to the output folder containing slides and audio
+        slide_count: Number of slides in the presentation
+        
+    Returns:
+        List of paths to created video clips
+    """
+    try:
+        from moviepy import ImageClip, AudioFileClip
+        
+        logger.info("Creating individual video clips...")
+        
+        clips_folder = output_folder / "clips"
+        clips_folder.mkdir(exist_ok=True)
+        
+        clip_paths = []
+        
+        for i in range(1, slide_count + 1):
+            try:
+                image_file = output_folder / f"slide_{i:02d}.png"
+                audio_file = output_folder / f"audio_{i:02d}.wav"
+                clip_file = clips_folder / f"clip_{i:02d}.mp4"
+                
+                # Check if clip already exists and is newer than source files
+                if clip_file.exists():
+                    clip_mtime = clip_file.stat().st_mtime
+                    image_mtime = image_file.stat().st_mtime
+                    audio_mtime = audio_file.stat().st_mtime
+                    
+                    if clip_mtime > image_mtime and clip_mtime > audio_mtime:
+                        logger.info(f"Clip {i}/{slide_count} already exists and is up-to-date, reusing...")
+                        clip_paths.append(clip_file)
+                        continue
+                
+                logger.info(f"Creating video clip {i}/{slide_count}...")
+                
+                audio = AudioFileClip(str(audio_file))
+                image = ImageClip(str(image_file)).with_duration(audio.duration)
+                video = image.with_audio(audio)
+                
+                video.write_videofile(
+                    str(clip_file),
+                    fps=VIDEO_CONFIG['fps'],
+                    codec=VIDEO_CONFIG['codec'],
+                    audio_codec=VIDEO_CONFIG['audio_codec'],
+                    preset=VIDEO_CONFIG['preset'],
+                    bitrate=VIDEO_CONFIG['bitrate'],
+                    logger=None  # Suppress MoviePy progress bars
+                )
+                
+                video.close()
+                audio.close()
+                
+                clip_paths.append(clip_file)
+                logger.info(f"Successfully created clip {i}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create clip {i}: {e}")
+                raise
+        
+        logger.info("Individual clip creation completed")
+        return clip_paths
+        
+    except Exception as e:
+        logger.error(f"Error during clip creation: {e}")
+        raise
+
+
+def concatenate_clips(clip_paths: list, output_file: Path) -> None:
+    """
+    Concatenate all video clips into a single final video using FFmpeg.
+    
+    Args:
+        clip_paths: List of paths to individual video clips
+        output_file: Path where the final video should be saved
+    """
+    try:
+        import imageio_ffmpeg
+        
+        logger.info(f"Concatenating {len(clip_paths)} clips into final video...")
+        
+        # Create a temporary file list for FFmpeg concat
+        concat_file = output_file.parent / "concat_list.txt"
+        with open(concat_file, 'w') as f:
+            for clip_path in clip_paths:
+                # Use forward slashes and escape special characters for FFmpeg
+                safe_path = str(clip_path.absolute()).replace('\\', '/')
+                f.write(f"file '{safe_path}'\n")
+        
+        # Get FFmpeg executable from imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # Use FFmpeg directly for concatenation
+        result = subprocess.run(
+            [
+                ffmpeg_exe, '-f', 'concat', '-safe', '0', '-i', str(concat_file),
+                '-c', 'copy', str(output_file), '-y'
+            ],
+            capture_output=True,
+            text=True
+        )
+        
+        # Clean up temp file
+        concat_file.unlink()
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg error: {result.stderr}")
+            raise RuntimeError(f"FFmpeg concatenation failed: {result.stderr}")
+        
+        logger.info(f"Final video created: {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error during video concatenation: {e}")
+        raise
+
+
+def create_presentation_video(output_folder: Path, slide_count: int) -> None:
+    """
+    Create final presentation video from slides and audio files.
+    
+    Args:
+        output_folder: Path to the output folder
+        slide_count: Number of slides in the presentation
+    """
+    try:
+        logger.info("Starting video creation process...")
+        
+        # Step 1: Create individual clips (with caching)
+        clip_paths = create_individual_clips(output_folder, slide_count)
+        
+        # Step 2: Concatenate into final video
+        final_video_path = output_folder / f"{output_folder.name}_video.mp4"
+        concatenate_clips(clip_paths, final_video_path)
+        
+        logger.info("Video creation completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Failed to create presentation video: {e}")
+        raise
+
+
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
@@ -243,6 +399,9 @@ def main():
         
         # Generate audio from speaker notes
         generate_audio_from_notes(output_folder, slide_count)
+        
+        # Create presentation video
+        create_presentation_video(output_folder, slide_count)
         
         logger.info(f"Successfully processed {slide_count} slides")
         logger.info(f"Output saved to: {output_folder}")
