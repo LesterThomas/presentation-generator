@@ -170,14 +170,23 @@ def extract_speaker_notes(pptx_path: Path, output_folder: Path, slide_count: int
                 notes_slide = slide.notes_slide
                 notes_text = notes_slide.notes_text_frame.text if notes_slide else ""
                 
-                # Save to text file
+                # Save to text file (only if content has changed)
                 output_file = output_folder / f"text_{visible_slide_num:02d}.txt"
-                output_file.write_text(notes_text, encoding='utf-8')
                 
-                if notes_text.strip():
-                    logger.info(f"Extracted notes for slide {i} as text_{visible_slide_num:02d}.txt")
-                else:
-                    logger.info(f"No notes found for slide {i} (text_{visible_slide_num:02d}.txt)")
+                # Check if file exists and content is unchanged
+                should_write = True
+                if output_file.exists():
+                    existing_text = output_file.read_text(encoding='utf-8')
+                    if existing_text == notes_text:
+                        should_write = False
+                        logger.info(f"Text {visible_slide_num} unchanged, preserving timestamp for caching")
+                
+                if should_write:
+                    output_file.write_text(notes_text, encoding='utf-8')
+                    if notes_text.strip():
+                        logger.info(f"Extracted notes for slide {i} as text_{visible_slide_num:02d}.txt")
+                    else:
+                        logger.info(f"No notes found for slide {i} (text_{visible_slide_num:02d}.txt)")
                     
             except Exception as e:
                 logger.error(f"Failed to extract notes for slide {i}: {e}")
