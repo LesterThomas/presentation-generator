@@ -34,12 +34,19 @@ class Options:
         return cls(**{k: getattr(a, k) for k in cls.__dataclass_fields__ if hasattr(a, k)})
 
 
+def audio_newer(out: Path, e: dict) -> bool:
+    """Has the slide's narration (e.g. a new recording) changed since its clip was made?"""
+    audio, clip = out / (e.get("audio") or "-"), out / e.get("clip", "-")
+    return audio.exists() and clip.exists() and audio.stat().st_mtime > clip.stat().st_mtime
+
+
 def clip_current(out: Path, manifest: "render.Manifest", slide) -> bool:
-    """Is there a clip made from exactly this version of the slide?"""
+    """Is there a clip made from exactly this version of the slide and its narration?"""
     e = manifest.data.get(slide.stem, {})
     return (e.get("fingerprint") == slide.fingerprint and "timing" in e  # clips before timing alignment are redone
             and (e.get("audio") or not slide.notes.strip())              # a narrated slide's clip must have narration
-            and (out / e.get("clip", "-")).exists())
+            and (out / e.get("clip", "-")).exists()
+            and not audio_newer(out, e))
 
 
 def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(), deck: Path = None,
@@ -109,8 +116,10 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
     return [s for s, _, _, _ in plan], failed
 
 
-def build_final(pptx: Path, partial: bool = False, ignore_approvals: bool = False):
+def build_final(pptx: Path, partial: bool = False, ignore_approvals: bool = False, require_validation: bool = False):
     """Join the clips into the final video once every visible slide is approved and rendered.
+
+    With require_validation (the review server), each slide's narration must also be validated.
 
     Returns the video's path, or None (with the reason logged) when the deck isn't ready.
     """
@@ -118,7 +127,8 @@ def build_final(pptx: Path, partial: bool = False, ignore_approvals: bool = Fals
     state = ReviewState(pptx)
     manifest = render.Manifest(out)
     visible = [s for s in load_slides(out) if not s.hidden]
-    ready = [s for s in visible if clip_current(out, manifest, s) and (ignore_approvals or state.is_approved(s))]
+    ready = [s for s in visible if clip_current(out, manifest, s) and (ignore_approvals or state.is_approved(s))
+             and (not require_validation or state.validated(s, manifest.data.get(s.stem, {}).get("key")))]
     missing = [s for s in visible if s not in ready]
     final = out / f"{out.name}_video.mp4"
     if (missing and not partial) or not ready:

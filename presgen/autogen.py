@@ -117,13 +117,14 @@ class AutoGenerator(threading.Thread):
         self._final(did)
 
     def _final(self, did: bool) -> None:
-        """Rebuild the final video whenever the set of approved, rendered slides changes."""
+        """Rebuild the final video whenever the set of approved, rendered, validated slides changes."""
         out = output_dir(self.pptx)
         state = ReviewState(self.pptx)
         manifest = render.Manifest(out)
         visible = [s for s in load_slides(out) if not s.hidden]
-        ready = tuple((s.stem, s.fingerprint) for s in visible
-                      if state.is_approved(s) and pipeline.clip_current(out, manifest, s))
+        ready = tuple((s.stem, s.fingerprint, manifest.data.get(s.stem, {}).get("key")) for s in visible
+                      if state.is_approved(s) and pipeline.clip_current(out, manifest, s)
+                      and state.validated(s, manifest.data.get(s.stem, {}).get("key")))
         if ready == self._last_ready and not did:
             return
         self._last_ready = ready
@@ -133,6 +134,6 @@ class AutoGenerator(threading.Thread):
             return
         with self.lock:
             self.final = {"state": "building"}
-        video = pipeline.build_final(self.pptx)
+        video = pipeline.build_final(self.pptx, require_validation=True)
         with self.lock:
             self.final = {"state": "ready" if video else "waiting", "ready": len(ready), "total": len(visible)}

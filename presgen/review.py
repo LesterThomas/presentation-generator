@@ -83,6 +83,20 @@ class ReviewState:
     def is_approved(self, slide) -> bool:
         return self.status(slide) == "approved"
 
+    def validated(self, slide, clip_key) -> bool:
+        """Has the reviewer validated the narration of exactly this clip?"""
+        e = self.data["slides"].get(str(slide.slide_id), {})
+        return bool(clip_key) and e.get("validated_key") == clip_key
+
+    def set_validated(self, slide, clip_key, on: bool, by: str = "cli") -> None:
+        e = self.entry(slide.slide_id)
+        if on:
+            e["validated_key"] = clip_key
+        else:
+            e.pop("validated_key", None)
+        e["history"].append({"at": _now(), "action": "validate" if on else "unvalidate", "by": by,
+                             "comment": "", "fingerprint": slide.fingerprint})
+
     def apply(self, slide, action: str, comment: str = "", by: str = "cli") -> None:
         if slide.hidden:
             raise ValueError(f"slide {slide.number} is hidden")
@@ -145,6 +159,27 @@ def change_status(pptx: Path, spec: str, action: str, comment: str = "", by: str
         return chosen
 
 
+def set_validation(pptx: Path, number: int, on: bool, by: str = "review page") -> None:
+    """Mark a slide's narrated clip as validated (or not). Only an approved slide with a current clip."""
+    from .pipeline import clip_current
+    from .render import Manifest
+    with _lock:
+        out = output_dir(pptx)
+        slide = {s.number: s for s in load_slides(out)}.get(number)
+        if slide is None or slide.hidden:
+            raise ValueError(f"no visible slide {number}")
+        state = ReviewState(pptx)
+        manifest = Manifest(out)
+        if on and not (state.is_approved(slide) and clip_current(out, manifest, slide)):
+            raise ValueError("approve the slide and wait for its narrated clip before validating it")
+        state.set_validated(slide, manifest.data.get(slide.stem, {}).get("key"), on, by)
+        state.save()
+        event = {"at": _now(), "action": "validate" if on else "unvalidate", "slides": [number],
+                 "titles": [slide.title], "comment": "", "by": by}
+        with open(events_path(pptx), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 def events_path(pptx: Path) -> Path:
     """One JSON line per review action: what a watcher (e.g. Claude) follows to act on requests."""
     return output_dir(pptx) / "review-events.jsonl"
@@ -161,10 +196,6 @@ def save_recording(pptx: Path, number: int, data: bytes, mime: str) -> dict:
     generated narration lives. Its newer timestamp makes the pipeline use it instead of the voice.
     The slide's clip record is dropped, so the clip is rebuilt with the recording.
     """
-    import subprocess
-    import wave
-    from .render import FFMPEG, Manifest
-
     out = output_dir(pptx)
     slide = {s.number: s for s in load_slides(out)}.get(number)
     if slide is None or slide.hidden:
@@ -177,24 +208,58 @@ def save_recording(pptx: Path, number: int, data: bytes, mime: str) -> dict:
     rec_dir.mkdir(exist_ok=True)
     src = rec_dir / f"slide_{slide.stem}_{stamp}.{ext}"
     src.write_bytes(data)
-    tmp = out / f"audio_{slide.stem}.rec.wav"
+    return process_recording(out, slide, src, stamp)
+
+
+def process_recording(out: Path, slide, src: Path, stamp: str) -> dict:
+    """Trim the recording `src`, match it to the generated voice, and make it the slide's narration."""
+    import subprocess
+    import wave
+    from .render import FFMPEG, Manifest
+    from .voicematch import match
+
+    trimmed = out / f"audio_{slide.stem}.rec.wav"
     trim = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1,areverse,"
             "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.35,areverse")
     r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af", trim,
-                        "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(tmp)], capture_output=True, text=True)
-    if r.returncode != 0 or not tmp.exists():
+                        "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(trimmed)], capture_output=True, text=True)
+    if r.returncode != 0 or not trimmed.exists():
         raise ValueError(f"could not convert the recording: {r.stderr.strip()[-200:]}")
+    matched = out / f"audio_{slide.stem}.matched.wav"
+    try:
+        info = match(trimmed, matched, out)
+    except ValueError as e:  # no generated narration to match yet: keep the plain conversion
+        log.warning(f"Slide {slide.number}: recording not voice-matched ({e})")
+        info, matched = {}, trimmed
     audio = out / f"audio_{slide.stem}.wav"
-    tmp.replace(audio)
+    matched.replace(audio)
+    trimmed.unlink(missing_ok=True)
     with wave.open(str(audio)) as w:
         secs = w.getnframes() / w.getframerate()
     (out / f"audio_{slide.stem}.json").write_text(json.dumps(
-        {"manual": True, "recorded_at": stamp, "source": src.name, "sha": sha256_file(audio)}), encoding="utf-8")
+        {"manual": True, "recorded_at": stamp, "source": src.name, "sha": sha256_file(audio), "match": info}),
+        encoding="utf-8")
     manifest = Manifest(out)
     manifest.data.pop(slide.stem, None)
     manifest.save()
-    log.info(f"Slide {number}: using your recording ({secs:.1f}s, kept as recordings/{src.name})")
-    return {"slide": number, "secs": round(secs, 1)}
+    log.info(f"Slide {slide.number}: using your recording ({secs:.1f}s, kept as recordings/{src.name})"
+             + (f"; matched to the voice: EQ {info['eq_db']} dB, {info['lufs_before']} -> {info['lufs_after']} LUFS" if info else ""))
+    return {"slide": slide.number, "secs": round(secs, 1)}
+
+
+def rematch_recordings(pptx: Path, numbers=None) -> list:
+    """Re-process slides' existing recordings (from recordings/) with the current voice matching."""
+    out = output_dir(pptx)
+    done = []
+    for s in load_slides(out):
+        meta = out / f"audio_{s.stem}.json"
+        if s.hidden or (numbers and s.number not in numbers) or not _manual_audio(out, s.stem):
+            continue
+        m = json.loads(meta.read_text(encoding="utf-8"))
+        src = out / "recordings" / m["source"]
+        if src.exists():
+            done.append(process_recording(out, s, src, m.get("recorded_at", "")))
+    return done
 
 
 def _manual_audio(out: Path, stem: str) -> bool:
@@ -229,9 +294,11 @@ def page_data(pptx: Path, gen=None) -> dict:
     for s in slides:
         e = state.data["slides"].get(str(s.slide_id), {})
         r = render.get(s.stem, {})
+        from .pipeline import audio_newer
         clip = r.get("clip") if (r.get("fingerprint") == s.fingerprint and "timing" in r
                                  and (r.get("audio") or not s.notes.strip())  # never show a silent clip as narrated
-                                 and (out / r.get("clip", "-")).exists()) else None
+                                 and (out / r.get("clip", "-")).exists()
+                                 and not audio_newer(out, r)) else None
         preview = f"previews/slide_{s.stem}.mp4"
         rows.append({
             "number": s.number, "slideId": s.slide_id, "title": s.title, "notes": s.notes,
@@ -245,6 +312,7 @@ def page_data(pptx: Path, gen=None) -> dict:
             "timing": r.get("timing") if clip else None,
             "job": live["jobs"].get(s.stem),
             "manualAudio": (not s.hidden) and _manual_audio(out, s.stem),
+            "validated": bool(clip) and state.validated(s, r.get("key")),
         })
     final = out / f"{out.name}_video.mp4"
     built = render.get("_final", {})
@@ -360,6 +428,12 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 action = body.get("action")
+                if action in ("validate", "unvalidate"):
+                    set_validation(pptx, int(body["slides"]), action == "validate")
+                    log.info(f"Review page: {action} slide {body['slides']}")
+                    if gen:
+                        gen.poke()
+                    return self._json(200, page_data(pptx, gen))
                 if action in ("revoice", "retry"):
                     if not gen:
                         raise ValueError("auto-generation is off: use `presgen.py generate`")

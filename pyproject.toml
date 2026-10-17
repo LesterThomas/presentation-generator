@@ -7,6 +7,7 @@ dependencies = [
     "comtypes>=1.4.0",
     "python-pptx>=0.6.21",
     "imageio-ffmpeg>=0.4.9",
+    "numpy>=1.24.4",
 ]
 
 [tool.uv]

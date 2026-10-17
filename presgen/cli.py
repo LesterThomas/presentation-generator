@@ -127,6 +127,14 @@ def print_status(pptx: Path, as_json: bool = False) -> dict:
     return counts
 
 
+def cmd_rematch(a) -> None:
+    from .review import rematch_recordings
+    numbers = {s.number for s in parse_slides(a.slides, load_slides(output_dir(a.deck)))} if a.slides else None
+    done = rematch_recordings(a.deck, numbers)
+    log.info(f"Re-processed {len(done)} recording(s): " + ", ".join(f"slide {d['slide']}" for d in done)
+             + ". A running review server rebuilds their clips (approved slides).")
+
+
 def cmd_status(a) -> None:
     if not load_slides(output_dir(a.deck)):
         raise SystemExit("The deck has not been inspected yet: run `review` first")
@@ -226,6 +234,11 @@ def main(argv=None) -> None:
         sp.add_argument("-m", "--message", help="comment (required for `changes` and `reply`)")
         sp.add_argument("--by", default="cli", help="who is acting (shown in the history)")
         sp.set_defaults(func=cmd_change)
+
+    sp = sub.add_parser("rematch", help="re-process recorded narration so it matches the generated voice")
+    deck_arg(sp)
+    sp.add_argument("--slides", help="only these slides (default: every slide with a recording)")
+    sp.set_defaults(func=cmd_rematch)
 
     sp = sub.add_parser("status", help="show each slide's review status")
     deck_arg(sp)

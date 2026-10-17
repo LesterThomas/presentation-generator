@@ -154,10 +154,11 @@ function renderHeader() {
   const vis = data.slides.filter(s => !s.hidden).length;
   $("bar").style.width = (100 * (counts.approved || 0) / Math.max(vis, 1)) + "%";
   const f = data.final || {};
+  const shown = data.slides.filter(x => !x.hidden), nval = shown.filter(x => x.validated).length;
   $("final").innerHTML = f.state === "building" ? `<span class="hint">Building the final video…</span>`
     : data.video && data.videoCurrent && f.state !== "waiting" ? `<a href="${esc(data.video)}${ver()}" target="_blank">Final video</a>`
     : (data.video ? `<a href="${esc(data.video)}${ver()}" target="_blank">Final video</a> <span class="hint">(out of date)</span> ` : "")
-      + (f.total ? `<span class="hint">${f.ready}/${f.total} slides ready</span>` : "");
+      + `<span class="hint">${nval}/${shown.length} narrations validated</span>`;
 }
 
 function renderList() {
@@ -166,6 +167,7 @@ function renderList() {
       ${s.image ? `<img loading="lazy" src="${esc(s.image)}${ver()}" alt="">` : `<div class="ph"></div>`}
       <div class="meta"><b><span class="dot s-${s.status}" style="display:inline-block;margin-right:6px"></span>${s.number}${
         busyJob(s) ? ` <span class="badge-mini">⟳ ${esc(s.job.state)}</span>` : s.job ? ` <span class="badge-mini warnline">failed</span>`
+        : s.validated ? ` <span class="badge-mini" style="color:var(--approved)">✓ validated</span>`
         : s.clip ? ` <span class="badge-mini">♪ narrated</span>` : ""}</b>
         <span>${esc(s.title)}</span></div>
     </div>`).join("") || `<p class="hint" style="padding:12px">No slides match.</p>`;
@@ -220,6 +222,7 @@ function renderView() {
           <span class="lab">${s.status === "approved" ? "Approved" : "Draft"}</span>
         </button>
         ${generation(s)}
+        ${validationToggle(s)}
         ${LIVE && data.auto ? `<div class="rec" id="rec"></div>` : ""}
         <p class="hint">${LIVE ? "Keys: ← → move · A toggle approval · N next to review"
           : `Read-only copy. Run <code>uv run presgen.py review</code> for live controls, or <code>${esc(cli)}</code>`}</p>
@@ -233,11 +236,12 @@ function renderView() {
         `<li>${esc(h.at.replace("T", " ").slice(0, 16))} · ${esc(h.action)} · ${esc(h.by)}${h.comment ? " · " + esc(h.comment) : ""}</li>`).join("")}</ul></div>` : ""}
       <div class="card hint">${data.auto ? "Approving a slide narrates and renders it straight away."
         : "Auto-generation is off: approved slides are narrated by <code>uv run presgen.py generate</code>."}
-        The final video is rebuilt whenever every visible slide is approved and rendered.</div>
+        Once every slide's narration is validated, the final video is built automatically.</div>
     </div>`;
   $("view").querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { tab = b.dataset.tab; renderView(); });
   if (!s.hidden && LIVE) {
     $("toggle").onclick = toggleApproval;
+    if ($("vtoggle")) $("vtoggle").onclick = () => act(s.validated ? "unvalidate" : "validate", "");
     $("changes").onclick = () => {
       const c = $("comment").value.trim();
       if (!c) { $("comment").focus(); toast("Add a comment first"); return; }
@@ -246,6 +250,19 @@ function renderView() {
     $("view").querySelectorAll("[data-gen]").forEach(b => b.onclick = () => act(b.dataset.gen, ""));
     if ($("rec")) renderRec();
   }
+}
+
+function validationToggle(s) {
+  const ready = s.clip && s.status === "approved" && !busyJob(s);
+  return `<div class="gen" style="margin-top:14px">
+    <button class="switch" id="vtoggle" role="switch" aria-checked="${!!s.validated}" ${LIVE && ready ? "" : "disabled"}
+      title="Listen to the narrated clip, then validate it">
+      <span class="track"><span class="knob"></span></span>
+      <span class="lab">${s.validated ? "Narration validated" : "Narration not validated"}</span>
+    </button>
+    <div class="hint">${s.validated ? "This clip is ready for the final video."
+      : ready ? "Listen to the narrated clip, then validate it. The final video is built once every slide is validated."
+      : "Available once the slide is approved and its narrated clip is ready."}</div></div>`;
 }
 
 function toggleApproval() {
@@ -373,7 +390,8 @@ async function act(action, comment) {
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || r.statusText);
     data = body; renderHeader();
-    toast(action === "revoice" ? `Slide ${s.number}: narrating again` : action === "retry" ? `Slide ${s.number}: retrying`
+    toast(action === "validate" ? `Slide ${s.number}: narration validated` : action === "unvalidate" ? `Slide ${s.number}: narration not validated`
+      : action === "revoice" ? `Slide ${s.number}: narrating again` : action === "retry" ? `Slide ${s.number}: retrying`
       : `Slide ${s.number}: ${LABEL[data.slides[sel].status].toLowerCase()}`);
     renderList(); renderView();
   } catch (e) { toast("Could not save: " + e.message); }
