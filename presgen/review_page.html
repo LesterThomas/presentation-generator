@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slide Review</title>
+<style>
+  :root {
+    --bg: #f4f5f8; --panel: #ffffff; --edge: #dfe2ea; --text: #161a23; --muted: #5f6677;
+    --accent: #2f6fed; --approved: #1f9d55; --pending: #8a90a0; --changes: #d97a00; --changed: #8b5cf6;
+    --stage: #0a0f1e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d1017; --panel: #161a23; --edge: #262c3a; --text: #e8eaf0; --muted: #9aa1b2;
+      --accent: #5b8cff; --approved: #34c374; --pending: #7d8496; --changes: #f0a03a; --changed: #a78bfa;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--edge); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px;
+          border: 1px solid var(--edge); font-size: 12px; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pending); flex: none; }
+  .s-approved { background: var(--approved); } .s-changes-requested { background: var(--changes); }
+  .s-changed { background: var(--changed); } .s-hidden { background: transparent; border: 1px dashed var(--pending); }
+  .progress { flex: 1 1 160px; height: 6px; background: var(--edge); border-radius: 3px; overflow: hidden; min-width: 120px; }
+  .progress div { height: 100%; background: var(--approved); width: 0; transition: width .3s; }
+  .spacer { flex: 1; }
+  button, select { font: inherit; border-radius: 8px; border: 1px solid var(--edge); background: var(--panel);
+                   color: var(--text); padding: 6px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--approved); border-color: var(--approved); color: #fff; font-weight: 600; }
+  button.warn { border-color: var(--changes); color: var(--changes); font-weight: 600; }
+  a { color: var(--accent); }
+  main { display: grid; grid-template-columns: 260px 1fr; gap: 0; min-height: calc(100vh - 58px); }
+  nav { border-right: 1px solid var(--edge); overflow-y: auto; max-height: calc(100vh - 58px); position: sticky; top: 58px; }
+  nav .item { display: grid; grid-template-columns: 96px 1fr; gap: 10px; padding: 8px 12px; cursor: pointer;
+              border-left: 3px solid transparent; align-items: center; }
+  nav .item:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  nav .item.sel { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  nav img { width: 96px; aspect-ratio: 16/9; object-fit: cover; border-radius: 4px; background: var(--stage); display: block; }
+  nav .ph { width: 96px; aspect-ratio: 16/9; border-radius: 4px; border: 1px dashed var(--edge); }
+  nav .meta { min-width: 0; font-size: 12px; }
+  nav .meta b { display: block; font-size: 12px; }
+  nav .meta span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); }
+  section.view { padding: 20px; display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-content: start; }
+  .stage { background: var(--stage); border-radius: 10px; overflow: hidden; aspect-ratio: 16/9; display: grid; place-items: center; }
+  .stage video, .stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .tabs { display: flex; gap: 6px; margin: 10px 0 0; flex-wrap: wrap; }
+  .tabs button { padding: 4px 10px; font-size: 12px; }
+  .tabs button.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 14px 16px; }
+  .notes { margin-top: 16px; white-space: pre-wrap; font-size: 15px; line-height: 1.6; }
+  .notes h3, .side h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .title { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+  textarea { width: 100%; min-height: 90px; font: inherit; border-radius: 8px; border: 1px solid var(--edge);
+             background: var(--bg); color: var(--text); padding: 8px; resize: vertical; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .history { list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--muted); }
+  .history li { padding: 3px 0; border-top: 1px solid var(--edge); }
+  code { font-family: Consolas, ui-monospace, monospace; font-size: 12px; background: var(--bg); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 8px 16px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.on { opacity: .95; }
+  @media (max-width: 1100px) { section.view { grid-template-columns: 1fr; } }
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; }
+    nav { position: relative; top: 0; max-height: 220px; border-right: 0; border-bottom: 1px solid var(--edge); }
+    header, section.view { padding: 12px 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="deck">Slide review</h1>
+  <div class="counts" id="counts"></div>
+  <div class="progress" title="approved"><div id="bar"></div></div>
+  <select id="filter" aria-label="Filter slides">
+    <option value="all">All slides</option>
+    <option value="open">Needs review</option>
+    <option value="approved">Approved</option>
+    <option value="changes-requested">Changes requested</option>
+  </select>
+  <button id="nextOpen" title="Next slide that needs review (N)">Next to review</button>
+  <span id="final"></span>
+</header>
+<main>
+  <nav id="list" aria-label="Slides"></nav>
+  <section class="view" id="view"></section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const INITIAL = /*__DATA__*/null;
+const LIVE = location.protocol.startsWith("http");
+const LABEL = { "approved": "Approved", "pending": "Pending", "changes-requested": "Changes requested",
+                "changed": "Changed since approval", "hidden": "Hidden (skipped)" };
+let data = INITIAL, sel = 0, tab = null, filter = "all";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const needsReview = s => !s.hidden && s.status !== "approved";
+const ver = () => "?v=" + encodeURIComponent(data.inspectedAt || "");
+
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); setTimeout(() => t.classList.remove("on"), 1800); }
+
+function visibleRows() {
+  return data.slides.map((s, i) => [s, i]).filter(([s]) =>
+    filter === "all" ? true : filter === "open" ? needsReview(s) : s.status === filter);
+}
+
+function renderHeader() {
+  $("deck").textContent = data.deck;
+  document.title = "Review: " + data.deck.replace(/\.pptx?$/i, "");
+  const counts = {};
+  data.slides.forEach(s => counts[s.status] = (counts[s.status] || 0) + 1);
+  $("counts").innerHTML = ["approved", "pending", "changes-requested", "changed", "hidden"].filter(k => counts[k])
+    .map(k => `<span class="chip"><span class="dot s-${k}"></span>${counts[k]} ${LABEL[k].toLowerCase()}</span>`).join("");
+  const vis = data.slides.filter(s => !s.hidden).length;
+  $("bar").style.width = (100 * (counts.approved || 0) / Math.max(vis, 1)) + "%";
+  $("final").innerHTML = data.video ? `<a href="${esc(data.video)}${ver()}" target="_blank">Final video</a>`
+    + (data.videoCurrent ? "" : ` <span class="hint">(out of date)</span>`) : "";
+}
+
+function renderList() {
+  $("list").innerHTML = visibleRows().map(([s, i]) => `
+    <div class="item ${i === sel ? "sel" : ""}" data-i="${i}">
+      ${s.image ? `<img loading="lazy" src="${esc(s.image)}${ver()}" alt="">` : `<div class="ph"></div>`}
+      <div class="meta"><b><span class="dot s-${s.status}" style="display:inline-block;margin-right:6px"></span>${s.number}</b>
+        <span>${esc(s.title)}</span></div>
+    </div>`).join("") || `<p class="hint" style="padding:12px">No slides match.</p>`;
+  $("list").querySelectorAll(".item").forEach(el => el.onclick = () => select(+el.dataset.i));
+  const cur = $("list").querySelector(".sel"), nav = $("list");
+  if (cur) {  // scroll the slide list only, never the page
+    if (cur.offsetTop < nav.scrollTop) nav.scrollTop = cur.offsetTop;
+    else if (cur.offsetTop + cur.offsetHeight > nav.scrollTop + nav.clientHeight)
+      nav.scrollTop = cur.offsetTop + cur.offsetHeight - nav.clientHeight;
+  }
+}
+
+function media(s) {
+  const opts = [];
+  if (s.clip) opts.push(["clip", "Narrated clip"]);
+  if (s.preview) opts.push(["preview", "Silent preview"]);
+  if (s.image) opts.push(["still", "Still"]);
+  return opts;
+}
+
+function renderView() {
+  const s = data.slides[sel];
+  if (!s) { $("view").innerHTML = ""; return; }
+  const opts = media(s);
+  if (!opts.find(o => o[0] === tab)) tab = opts.length ? opts[0][0] : null;
+  const src = tab === "clip" ? s.clip : tab === "preview" ? s.preview : s.image;
+  const stage = !src ? `<p class="hint">Hidden slide: not part of the video.</p>`
+    : tab === "still" ? `<img src="${esc(src)}${ver()}" alt="Slide ${s.number}">`
+    : `<video id="vid" src="${esc(src)}${ver()}" controls autoplay ${tab === "preview" ? "muted loop" : ""} playsinline></video>`;
+  const words = (s.notes.trim().match(/\S+/g) || []).length;
+  const cli = `uv run presgen.py approve "${data.deck}" ${s.number}`;
+  $("view").innerHTML = `
+    <div>
+      <div class="stage">${stage}</div>
+      <div class="tabs">${opts.map(([k, l]) => `<button data-tab="${k}" class="${k === tab ? "on" : ""}">${l}</button>`).join("")}
+        ${s.secs ? `<span class="hint" style="align-self:center">${s.secs.toFixed(1)} s</span>` : ""}</div>
+      <div class="card notes"><h3>Narration (speaker notes) · ${words} words · about ${Math.round(words / 2.5)} s</h3>${esc(s.notes) || '<span class="hint">No notes: this slide is silent.</span>'}</div>
+    </div>
+    <div class="side">
+      <div class="card">
+        <p class="title">${s.number}. ${esc(s.title)}</p>
+        <span class="badge"><span class="dot s-${s.status}"></span>${LABEL[s.status]}</span>
+        ${s.status === "changed" ? `<p class="hint">The slide changed after it was approved. Review it again.</p>` : ""}
+        ${s.comment && s.status !== "approved" ? `<p><b>Comment:</b> ${esc(s.comment)}</p>` : ""}
+      </div>
+      ${s.hidden ? "" : `<div class="card">
+        <h3>Your review</h3>
+        <textarea id="comment" placeholder="What should change? (needed to request changes)">${s.status === "changes-requested" ? esc(s.comment) : ""}</textarea>
+        <div class="actions">
+          <button class="primary" id="approve" ${LIVE ? "" : "disabled"} title="A">Approve &amp; next</button>
+          <button class="warn" id="changes" ${LIVE ? "" : "disabled"}>Request changes</button>
+          <button id="reset" ${LIVE ? "" : "disabled"}>Reset</button>
+        </div>
+        <p class="hint">${LIVE ? "Keys: ← → move · A approve · N next to review"
+          : `Read-only copy. Run <code>uv run presgen.py review</code> for live buttons, or <code>${esc(cli)}</code>`}</p>
+      </div>`}
+      ${s.history.length ? `<div class="card"><h3>History</h3><ul class="history">${s.history.slice().reverse().map(h =>
+        `<li>${esc(h.at.replace("T", " ").slice(0, 16))} · ${esc(h.action)} · ${esc(h.by)}${h.comment ? " · " + esc(h.comment) : ""}</li>`).join("")}</ul></div>` : ""}
+      <div class="card hint">Approved slides are narrated and rendered by <code>uv run presgen.py generate</code>.
+        The final video is built when every visible slide is approved.</div>
+    </div>`;
+  $("view").querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { tab = b.dataset.tab; renderView(); });
+  if (!s.hidden && LIVE) {
+    $("approve").onclick = () => act("approve", "", true);
+    $("changes").onclick = () => {
+      const c = $("comment").value.trim();
+      if (!c) { $("comment").focus(); toast("Add a comment first"); return; }
+      act("changes", c, false);
+    };
+    $("reset").onclick = () => act("reset", "", false);
+  }
+}
+
+function select(i) {
+  if (i < 0 || i >= data.slides.length) return;
+  if (i !== sel) tab = null;
+  sel = i; renderList(); renderView();
+  try { localStorage.setItem("presgen:" + data.deck, String(sel)); } catch (e) {}
+}
+
+function nextOpen() {
+  const n = data.slides.length;
+  for (let k = 1; k <= n; k++) { const i = (sel + k) % n; if (needsReview(data.slides[i])) return select(i); }
+  toast("Every slide is approved");
+}
+
+async function act(action, comment, advance) {
+  const s = data.slides[sel];
+  try {
+    const r = await fetch("api/review", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slides: String(s.number), action, comment }) });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    data = body; renderHeader();
+    toast(`Slide ${s.number}: ${LABEL[data.slides[sel].status].toLowerCase()}`);
+    if (advance) nextOpen(); else { renderList(); renderView(); }
+  } catch (e) { toast("Could not save: " + e.message); }
+}
+
+async function poll() {
+  if (!LIVE) return;
+  try {
+    const r = await fetch("api/state", { cache: "no-store" });
+    if (!r.ok) return;
+    const fresh = await r.json();
+    if (JSON.stringify(fresh) === JSON.stringify(data)) return;
+    const busy = document.activeElement && document.activeElement.id === "comment";
+    const same = JSON.stringify(fresh.slides[sel]) === JSON.stringify(data.slides[sel]) && fresh.inspectedAt === data.inspectedAt;
+    data = fresh; renderHeader(); renderList();
+    if (!busy && !same) renderView();  // don't interrupt a playing video for changes to other slides
+  } catch (e) {}
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.matches("textarea, input, select")) return;
+  if (e.key === "ArrowRight" || e.key === "ArrowDown") { e.preventDefault(); select(sel + 1); }
+  else if (e.key === "ArrowLeft" || e.key === "ArrowUp") { e.preventDefault(); select(sel - 1); }
+  else if ((e.key === "a" || e.key === "A") && LIVE && !data.slides[sel].hidden) act("approve", "", true);
+  else if (e.key === "n" || e.key === "N") nextOpen();
+});
+$("filter").onchange = e => { filter = e.target.value; renderList(); };
+$("nextOpen").onclick = nextOpen;
+
+if (data) {
+  try { const v = +localStorage.getItem("presgen:" + data.deck); if (v >= 0 && v < data.slides.length) sel = v; } catch (e) {}
+  renderHeader(); renderList(); renderView();
+  setInterval(poll, 5000);
+}
+</script>
+</body>
+</html>

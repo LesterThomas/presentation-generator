@@ -53,6 +53,10 @@ Test Presentation/
 *.txt
 *.mp4
 !pyproject.toml
+!presgen.py
+!presgen/
+!presgen/**
 !extract_slides.py
 !.gitignore
 !README.md
+__pycache__/
