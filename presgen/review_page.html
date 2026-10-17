@@ -285,12 +285,15 @@ function generation(s) {
       animation timed ×${t.factor.toFixed(2)} to match${t.clamped ? ". That's the limit, so this slide's animation should be retimed at source." : ""}</div>`
       + (t.cut_short ? `<div class="warnline">The narration is much faster than speech, so part of a sentence may be missing. Listen, then Re-voice.</div>` : "")
       + (t.phrased ? `<div class="hint">Voiced in short phrases, because the voice cut long sentences short. If the pauses sound choppy, shorten the sentences in the notes.</div>` : "") : "";
+    if (s.videoAudio)
+      return `<div class="gen"><div class="row">♪ Narrated clip ready (${s.secs.toFixed(1)} s) · sound from the slide's video</div></div>`;
     return `<div class="gen"><div class="row">♪ Narrated clip ready (${s.secs.toFixed(1)} s)${s.manualAudio ? " · your recording" : ""}
       ${data.auto ? `<button data-gen="revoice" title="Generate the narration again">Re-voice</button>` : ""}</div>${timing}</div>`;
   }
   if (s.status === "approved")
-    return `<div class="gen hint">${data.auto ? "Waiting to be narrated…" : "Not narrated yet."}</div>`;
-  return `<div class="gen hint">Approve to narrate and render this slide.</div>`;
+    return `<div class="gen hint">${data.auto ? (s.videoAudio ? "Waiting to be rendered…" : "Waiting to be narrated…") : "Not narrated yet."}</div>`;
+  return `<div class="gen hint">${s.videoAudio ? "Approve to render this slide with its video's own sound (EQ-matched, never voiced)."
+    : "Approve to narrate and render this slide."}</div>`;
 }
 
 // ---- manual narration: record in the browser, review, then use it for the slide
@@ -300,6 +303,10 @@ function renderRec() {
   const box = $("rec");
   if (!box) return;
   const s = data.slides[sel];
+  if (s && s.videoAudio) {
+    box.innerHTML = `<div class="hint">The narration is the sound of this slide's video, equalised to match the voice.</div>`;
+    return;
+  }
   if (rec.state === "recording") {
     const t = Math.floor((Date.now() - rec.start) / 1000);
     box.innerHTML = `<div class="row"><span class="recdot"></span><b>Recording ${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}</b>

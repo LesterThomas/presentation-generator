@@ -135,6 +135,24 @@ def cmd_rematch(a) -> None:
              + ". A running review server rebuilds their clips (approved slides).")
 
 
+def cmd_use_recording(a) -> None:
+    """Make an audio or video file the slide's narration, as if recorded on the review page."""
+    import shutil
+    from datetime import datetime
+    from .review import process_recording
+    out = output_dir(a.deck)
+    slide = {s.number: s for s in load_slides(out)}.get(a.slide)
+    if slide is None or slide.hidden:
+        raise SystemExit(f"No visible slide {a.slide}: run `refresh` after a rebuild")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    (out / "recordings").mkdir(exist_ok=True)
+    src = out / "recordings" / f"slide_{slide.stem}_{stamp}{a.file.suffix.lower()}"
+    shutil.copy2(a.file, src)
+    d = process_recording(out, slide, src, stamp, sync=a.sync)
+    log.info(f"Slide {d['slide']}: narration from {a.file.name} ({d['secs']}s"
+             + (", untrimmed and in sync with the slide's video" if a.sync else "") + ")")
+
+
 def cmd_status(a) -> None:
     if not load_slides(output_dir(a.deck)):
         raise SystemExit("The deck has not been inspected yet: run `review` first")
@@ -239,6 +257,14 @@ def main(argv=None) -> None:
     deck_arg(sp)
     sp.add_argument("--slides", help="only these slides (default: every slide with a recording)")
     sp.set_defaults(func=cmd_rematch)
+
+    sp = sub.add_parser("use-recording", help="use an audio or video file's sound as a slide's narration")
+    deck_arg(sp)
+    sp.add_argument("slide", type=int)
+    sp.add_argument("file", type=Path, help="audio, or a video whose sound is used")
+    sp.add_argument("--sync", action="store_true",
+                    help="the file is the slide's own presenter video: keep its sound untrimmed and in step")
+    sp.set_defaults(func=cmd_use_recording)
 
     sp = sub.add_parser("status", help="show each slide's review status")
     deck_arg(sp)

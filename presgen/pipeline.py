@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import render
 from .deck import load_slides
-from .review import ReviewState, output_dir
+from .review import ReviewState, output_dir, video_audio
 
 log = logging.getLogger("presgen")
 
@@ -92,6 +92,11 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
 
     for s in slides:  # 1. narration: the slow part
         on_stage(s, "narrating")
+        own = video_audio(out, s)
+        if own:  # a presenter video: its own sound (EQ-matched) is the narration, never the voice
+            audio[s.number] = own
+            log.info(f"Slide {s.number}: narration is the sound of the slide's video")
+            continue
         tts = opts.tts
         if s.number in redo_audio:
             # Re-voice: a genuinely new take. Forget the voice's cached takes of this slide's sentences and
@@ -115,6 +120,10 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
         if s in failed:
             continue
         t = render.timing(s, audio[s.number], opts.wps, opts.max_stretch)
+        meta = out / f"audio_{s.stem}.json"
+        if meta.exists() and json.loads(meta.read_text(encoding="utf-8")).get("sync"):
+            # Narration recorded with the slide's own video (a presenter clip): never stretch, or lips drift.
+            t = {**t, "factor": 1.0, "clamped": False, "sync": True}
         timings[s.number] = t
         if t["voice"]:
             log.info(f"Slide {s.number}: narration {t['voice']:.1f}s, planned {t['planned']:.1f}s"

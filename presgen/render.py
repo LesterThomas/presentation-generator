@@ -182,7 +182,9 @@ def add_narration(silent: Path, audio, secs: float, lead: float, mp4: Path, fact
     mp4.parent.mkdir(parents=True, exist_ok=True)
     narration = (["-i", str(audio)] if audio else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
     ms = int(lead * 1000)
-    chain = (f"[0:v]setpts=PTS*{factor},tpad=start_duration={lead}:start_mode=clone,fps={fps},format=yuv420p[vid];"
+    # fps must come before tpad: setpts leaves the frame rate unknown, and tpad then pads no frames at all,
+    # which put every slide's picture `lead` seconds ahead of its narration.
+    chain = (f"[0:v]setpts=PTS*{factor},fps={fps},tpad=start_duration={lead}:start_mode=clone,format=yuv420p[vid];"
              f"[1:a]aresample=48000,adelay={ms}:all=1,apad[n]")
     if _has_audio(silent):
         chain += (f";[0:a]aresample=48000,atempo={1 / factor:.5f},adelay={ms}:all=1,apad[v];"

@@ -211,8 +211,17 @@ def save_recording(pptx: Path, number: int, data: bytes, mime: str) -> dict:
     return process_recording(out, slide, src, stamp)
 
 
-def process_recording(out: Path, slide, src: Path, stamp: str) -> dict:
-    """Trim the recording `src`, match it to the generated voice, and make it the slide's narration."""
+# PowerPoint starts a slide's embedded video about 0.1 s after the slide (measured on deck 01's slide 1),
+# so sound taken from that video is delayed to match, or the voice runs ahead of the lips.
+SYNC_DELAY_MS = 100
+
+
+def process_recording(out: Path, slide, src: Path, stamp: str, sync: bool = False) -> dict:
+    """Trim the recording `src`, match it to the generated voice, and make it the slide's narration.
+
+    With `sync` the recording is the sound of the slide's own video (a presenter clip): it is not trimmed,
+    so it stays in step with the picture, and the pipeline never stretches the slide's timing.
+    """
     import subprocess
     import wave
     from .render import FFMPEG, Manifest
@@ -221,7 +230,7 @@ def process_recording(out: Path, slide, src: Path, stamp: str) -> dict:
     trimmed = out / f"audio_{slide.stem}.rec.wav"
     trim = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1,areverse,"
             "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.35,areverse")
-    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af", trim,
+    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-vn", "-af", f"adelay={SYNC_DELAY_MS}:all=1" if sync else trim,
                         "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(trimmed)], capture_output=True, text=True)
     if r.returncode != 0 or not trimmed.exists():
         raise ValueError(f"could not convert the recording: {r.stderr.strip()[-200:]}")
@@ -237,7 +246,8 @@ def process_recording(out: Path, slide, src: Path, stamp: str) -> dict:
     with wave.open(str(audio)) as w:
         secs = w.getnframes() / w.getframerate()
     (out / f"audio_{slide.stem}.json").write_text(json.dumps(
-        {"manual": True, "recorded_at": stamp, "source": src.name, "sha": sha256_file(audio), "match": info}),
+        {"manual": True, "recorded_at": stamp, "source": src.name, "sha": sha256_file(audio), "match": info,
+         **({"sync": True} if sync else {})}),
         encoding="utf-8")
     manifest = Manifest(out)
     manifest.data.pop(slide.stem, None)
@@ -258,8 +268,35 @@ def rematch_recordings(pptx: Path, numbers=None) -> list:
         m = json.loads(meta.read_text(encoding="utf-8"))
         src = out / "recordings" / m["source"]
         if src.exists():
-            done.append(process_recording(out, s, src, m.get("recorded_at", "")))
+            done.append(process_recording(out, s, src, m.get("recorded_at", ""), sync=bool(m.get("sync"))))
     return done
+
+
+def video_audio(out: Path, slide):
+    """The narration taken from the slide's own presenter video (`use-recording --sync`), or None.
+
+    Such a slide is never voiced: its narration is the video's sound, EQ-matched. If audio_NN.wav has
+    gone or been replaced, it is made again from the copy kept in recordings/.
+    """
+    if not _video_audio_meta(out, slide.stem):
+        return None
+    audio = out / f"audio_{slide.stem}.wav"
+    if not _manual_audio(out, slide.stem):
+        m = json.loads((out / f"audio_{slide.stem}.json").read_text(encoding="utf-8"))
+        src = out / "recordings" / m.get("source", "-")
+        if not src.exists():
+            return None
+        process_recording(out, slide, src, m.get("recorded_at", ""), sync=True)
+    return audio
+
+
+def _video_audio_meta(out: Path, stem: str) -> bool:
+    """Is the slide's narration the sound of its own video?"""
+    meta = out / f"audio_{stem}.json"
+    try:
+        return meta.exists() and bool(json.loads(meta.read_text(encoding="utf-8")).get("sync"))
+    except ValueError:
+        return False
 
 
 def _manual_audio(out: Path, stem: str) -> bool:
@@ -312,6 +349,7 @@ def page_data(pptx: Path, gen=None) -> dict:
             "timing": r.get("timing") if clip else None,
             "job": live["jobs"].get(s.stem),
             "manualAudio": (not s.hidden) and _manual_audio(out, s.stem),
+            "videoAudio": (not s.hidden) and _video_audio_meta(out, s.stem),
             "validated": bool(clip) and state.validated(s, r.get("key")),
         })
     final = out / f"{out.name}_video.mp4"
@@ -380,6 +418,8 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
                 job = (gen.snapshot()["jobs"].get(f"{number:02d}") if gen else None) or {}
                 if job.get("state") in ("narrating", "rendering"):
                     raise ValueError("this slide is being narrated right now: record again once it has finished")
+                if _video_audio_meta(output_dir(pptx), f"{number:02d}"):
+                    raise ValueError("this slide's narration is the sound of its own video")
                 data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 result = save_recording(pptx, number, data, self.headers.get("Content-Type", ""))
                 if gen:
@@ -438,6 +478,8 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
                     if not gen:
                         raise ValueError("auto-generation is off: use `presgen.py generate`")
                     for n in str(body["slides"]).split(","):
+                        if action == "revoice" and _video_audio_meta(output_dir(pptx), f"{int(n):02d}"):
+                            raise ValueError(f"slide {n}'s narration is the sound of its own video: it is not voiced")
                         gen.request(f"{int(n):02d}", revoice=action == "revoice")
                     log.info(f"Review page: {action} slide(s) {body['slides']}")
                     return self._json(200, page_data(pptx, gen))
