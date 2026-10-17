@@ -87,6 +87,11 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .warnline { color: var(--changes); }
   .badge-mini { font-size: 11px; color: var(--muted); margin-left: 4px; }
+  .rec { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--edge); }
+  .rec .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .rec audio { width: 100%; margin: 8px 0 4px; }
+  .recdot { width: 10px; height: 10px; border-radius: 50%; background: #e11d48; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
            padding: 8px 16px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; }
   .toast.on { opacity: .95; }
@@ -215,6 +220,7 @@ function renderView() {
           <span class="lab">${s.status === "approved" ? "Approved" : "Draft"}</span>
         </button>
         ${generation(s)}
+        ${LIVE && data.auto ? `<div class="rec" id="rec"></div>` : ""}
         <p class="hint">${LIVE ? "Keys: ← → move · A toggle approval · N next to review"
           : `Read-only copy. Run <code>uv run presgen.py review</code> for live controls, or <code>${esc(cli)}</code>`}</p>
       </div>
@@ -238,6 +244,7 @@ function renderView() {
       act("changes", c);
     };
     $("view").querySelectorAll("[data-gen]").forEach(b => b.onclick = () => act(b.dataset.gen, ""));
+    if ($("rec")) renderRec();
   }
 }
 
@@ -256,8 +263,10 @@ function generation(s) {
   if (s.clip) {
     const t = s.timing || {};
     const timing = t.voice ? `<div class="${t.clamped ? "warnline" : "hint"}">Voice ${t.voice.toFixed(1)} s, planned ${t.planned.toFixed(1)} s:
-      animation timed ×${t.factor.toFixed(2)} to match${t.clamped ? ". That's the limit, so this slide's animation should be retimed at source." : ""}</div>` : "";
-    return `<div class="gen"><div class="row">♪ Narrated clip ready (${s.secs.toFixed(1)} s)
+      animation timed ×${t.factor.toFixed(2)} to match${t.clamped ? ". That's the limit, so this slide's animation should be retimed at source." : ""}</div>`
+      + (t.cut_short ? `<div class="warnline">The narration is much faster than speech, so part of a sentence may be missing. Listen, then Re-voice.</div>` : "")
+      + (t.phrased ? `<div class="hint">Voiced in short phrases, because the voice cut long sentences short. If the pauses sound choppy, shorten the sentences in the notes.</div>` : "") : "";
+    return `<div class="gen"><div class="row">♪ Narrated clip ready (${s.secs.toFixed(1)} s)${s.manualAudio ? " · your recording" : ""}
       ${data.auto ? `<button data-gen="revoice" title="Generate the narration again">Re-voice</button>` : ""}</div>${timing}</div>`;
   }
   if (s.status === "approved")
@@ -265,8 +274,86 @@ function generation(s) {
   return `<div class="gen hint">Approve to narrate and render this slide.</div>`;
 }
 
+// ---- manual narration: record in the browser, review, then use it for the slide
+const rec = { state: "idle", recorder: null, chunks: [], blob: null, url: null, start: 0, timer: null, stream: null };
+
+function renderRec() {
+  const box = $("rec");
+  if (!box) return;
+  const s = data.slides[sel];
+  if (rec.state === "recording") {
+    const t = Math.floor((Date.now() - rec.start) / 1000);
+    box.innerHTML = `<div class="row"><span class="recdot"></span><b>Recording ${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}</b>
+      <button class="warn" id="recStop">■ Stop</button></div>
+      <div class="hint">Read the narration below at your normal pace.</div>`;
+    $("recStop").onclick = stopRecording;
+  } else if (rec.state === "review") {
+    box.innerHTML = `<div class="hint">Listen to your recording:</div><audio controls src="${rec.url}"></audio>
+      <div class="row"><button class="primary" id="recUse">Use this recording</button>
+      <button id="recAgain">Record again</button><button id="recDiscard">Discard</button></div>`;
+    $("recUse").onclick = uploadRecording;
+    $("recAgain").onclick = () => { discardRecording(); startRecording(); };
+    $("recDiscard").onclick = () => { discardRecording(); renderView(); };
+  } else if (rec.state === "uploading") {
+    box.innerHTML = `<div class="row"><span class="spin"></span>Saving your recording…</div>`;
+  } else {
+    const busy = busyJob(s);
+    box.innerHTML = `<div class="row"><button id="recStart" ${busy ? "disabled" : ""}>🎙 Record narration</button>
+      <span class="hint">${busy ? "Wait until narration finishes." : s.manualAudio ? "This slide uses your recording." : "Record this slide in your own voice."}</span></div>`;
+    $("recStart").onclick = startRecording;
+  }
+}
+
+async function startRecording() {
+  try {
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { toast("Microphone not available: " + e.message); return; }
+  const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+  rec.recorder = new MediaRecorder(rec.stream, type ? { mimeType: type } : undefined);
+  rec.chunks = [];
+  rec.recorder.ondataavailable = e => { if (e.data.size) rec.chunks.push(e.data); };
+  rec.recorder.onstop = () => {
+    rec.blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || "audio/webm" });
+    rec.url = URL.createObjectURL(rec.blob);
+    rec.stream.getTracks().forEach(t => t.stop());
+    clearInterval(rec.timer);
+    rec.state = "review";
+    renderRec();
+  };
+  const v = $("vid"); if (v) v.pause();
+  rec.recorder.start();
+  rec.start = Date.now();
+  rec.state = "recording";
+  rec.timer = setInterval(renderRec, 500);
+  renderRec();
+}
+
+function stopRecording() { if (rec.recorder && rec.recorder.state !== "inactive") rec.recorder.stop(); }
+
+function discardRecording() {
+  if (rec.recorder && rec.recorder.state !== "inactive") { rec.recorder.onstop = null; rec.recorder.stop(); }
+  if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
+  clearInterval(rec.timer);
+  if (rec.url) URL.revokeObjectURL(rec.url);
+  Object.assign(rec, { state: "idle", recorder: null, chunks: [], blob: null, url: null, stream: null });
+}
+
+async function uploadRecording() {
+  const s = data.slides[sel];
+  rec.state = "uploading"; renderRec();
+  try {
+    const r = await fetch(`api/record?slide=${s.number}`, { method: "POST", headers: { "Content-Type": rec.blob.type || "audio/webm" }, body: rec.blob });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    discardRecording();
+    data = body.state; renderHeader(); renderList(); renderView();
+    toast(`Slide ${s.number}: your recording (${body.secs.toFixed(1)} s) is being made into the clip`);
+  } catch (e) { rec.state = "review"; renderRec(); toast("Could not save: " + e.message); }
+}
+
 function select(i) {
   if (i < 0 || i >= data.slides.length) return;
+  if (i !== sel) discardRecording();
   if (i !== sel) tab = null;
   sel = i; renderList(); renderView();
   try { localStorage.setItem("presgen:" + data.deck, String(sel)); } catch (e) {}
@@ -303,7 +390,7 @@ async function poll() {
     const same = JSON.stringify(fresh.slides[sel]) === JSON.stringify(data.slides[sel]) && fresh.inspectedAt === data.inspectedAt;
     if (!data.slides[sel]?.clip && fresh.slides[sel]?.clip) tab = null;  // a new narrated clip: show it
     data = fresh; renderHeader(); renderList();
-    if (!busy && !same) renderView();  // don't interrupt a playing video for changes to other slides
+    if (!busy && !same && rec.state === "idle") renderView();  // don't interrupt a playing video for changes to other slides
   } catch (e) {}
 }
 

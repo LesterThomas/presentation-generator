@@ -99,7 +99,7 @@ class AutoGenerator(threading.Thread):
             deck = pipeline.snapshot(out, f"render_{s.stem}")
             try:
                 done, failed = pipeline.render_slides(self.pptx, [s], self.opts, redo, deck,
-                                                      on_stage=lambda sl, st: self._set(sl.stem, st))
+                                                      on_stage=lambda sl, st, **info: self._set(sl.stem, st, **info))
             except Exception as e:
                 log.exception(f"Slide {s.number}: could not render")
                 done, failed = [], [s]

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .deck import load_slides, write_atomic
+from .deck import load_slides, sha256_file, write_atomic
 
 log = logging.getLogger("presgen")
 
@@ -150,6 +150,66 @@ def events_path(pptx: Path) -> Path:
     return output_dir(pptx) / "review-events.jsonl"
 
 
+# ---------------------------------------------------------------- manual recordings
+
+
+def save_recording(pptx: Path, number: int, data: bytes, mime: str) -> dict:
+    """Use a narration the reviewer recorded in the browser for one slide.
+
+    The original upload is kept in recordings/. It is converted to the format the voice produces
+    (24 kHz mono WAV), with leading and trailing silence trimmed, and becomes audio_NN.wav, where
+    generated narration lives. Its newer timestamp makes the pipeline use it instead of the voice.
+    The slide's clip record is dropped, so the clip is rebuilt with the recording.
+    """
+    import subprocess
+    import wave
+    from .render import FFMPEG, Manifest
+
+    out = output_dir(pptx)
+    slide = {s.number: s for s in load_slides(out)}.get(number)
+    if slide is None or slide.hidden:
+        raise ValueError(f"no visible slide {number}")
+    if len(data) < 1000:
+        raise ValueError("the recording is empty")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ext = "webm" if "webm" in mime else "ogg" if "ogg" in mime else "wav" if "wav" in mime else "bin"
+    rec_dir = out / "recordings"
+    rec_dir.mkdir(exist_ok=True)
+    src = rec_dir / f"slide_{slide.stem}_{stamp}.{ext}"
+    src.write_bytes(data)
+    tmp = out / f"audio_{slide.stem}.rec.wav"
+    trim = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1,areverse,"
+            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.35,areverse")
+    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af", trim,
+                        "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(tmp)], capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists():
+        raise ValueError(f"could not convert the recording: {r.stderr.strip()[-200:]}")
+    audio = out / f"audio_{slide.stem}.wav"
+    tmp.replace(audio)
+    with wave.open(str(audio)) as w:
+        secs = w.getnframes() / w.getframerate()
+    (out / f"audio_{slide.stem}.json").write_text(json.dumps(
+        {"manual": True, "recorded_at": stamp, "source": src.name, "sha": sha256_file(audio)}), encoding="utf-8")
+    manifest = Manifest(out)
+    manifest.data.pop(slide.stem, None)
+    manifest.save()
+    log.info(f"Slide {number}: using your recording ({secs:.1f}s, kept as recordings/{src.name})")
+    return {"slide": number, "secs": round(secs, 1)}
+
+
+def _manual_audio(out: Path, stem: str) -> bool:
+    """Is audio_NN.wav the reviewer's own recording (and not since replaced by the voice)?"""
+    meta = out / f"audio_{stem}.json"
+    audio = out / f"audio_{stem}.wav"
+    if not meta.exists() or not audio.exists():
+        return False
+    try:
+        m = json.loads(meta.read_text(encoding="utf-8"))
+        return bool(m.get("manual")) and m.get("sha") == sha256_file(audio)
+    except (ValueError, OSError):
+        return False
+
+
 # ---------------------------------------------------------------- page data
 
 
@@ -170,6 +230,7 @@ def page_data(pptx: Path, gen=None) -> dict:
         e = state.data["slides"].get(str(s.slide_id), {})
         r = render.get(s.stem, {})
         clip = r.get("clip") if (r.get("fingerprint") == s.fingerprint and "timing" in r
+                                 and (r.get("audio") or not s.notes.strip())  # never show a silent clip as narrated
                                  and (out / r.get("clip", "-")).exists()) else None
         preview = f"previews/slide_{s.stem}.mp4"
         rows.append({
@@ -183,6 +244,7 @@ def page_data(pptx: Path, gen=None) -> dict:
             "secs": r.get("secs") if clip else None,
             "timing": r.get("timing") if clip else None,
             "job": live["jobs"].get(s.stem),
+            "manualAudio": (not s.hidden) and _manual_audio(out, s.stem),
         })
     final = out / f"{out.name}_video.mp4"
     built = render.get("_final", {})
@@ -240,6 +302,24 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
             self.send_header("Accept-Ranges", "bytes")
             super().end_headers()
 
+        def _record(self):
+            """POST /api/record?slide=N with the recorded audio as the body."""
+            try:
+                m = re.search(r"slide=(\d+)", self.path)
+                if not m:
+                    raise ValueError("which slide? (?slide=N)")
+                number = int(m.group(1))
+                job = (gen.snapshot()["jobs"].get(f"{number:02d}") if gen else None) or {}
+                if job.get("state") in ("narrating", "rendering"):
+                    raise ValueError("this slide is being narrated right now: record again once it has finished")
+                data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                result = save_recording(pptx, number, data, self.headers.get("Content-Type", ""))
+                if gen:
+                    gen.request(f"{number:02d}")
+                return self._json(200, {**result, "state": page_data(pptx, gen)})
+            except Exception as e:
+                return self._json(400, {"error": str(e)})
+
         def _range(self):
             """Byte ranges, so the browser can seek inside the slide videos."""
             path = Path(self.translate_path(self.path))
@@ -273,6 +353,8 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
                     left -= len(chunk)
 
         def do_POST(self):
+            if self.path.startswith("/api/record"):
+                return self._record()
             if self.path != "/api/review":
                 return self.send_error(404)
             try:

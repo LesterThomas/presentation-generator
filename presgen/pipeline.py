@@ -4,6 +4,7 @@ Shared by `presgen.py generate` (a batch from the command line) and the review s
 generator (one slide at a time, as soon as it is approved).
 """
 
+import json
 import logging
 import shutil
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ class Options:
     quality: int = 100
     wps: float = 2.5          # narration speed the deck's animations were planned for
     max_stretch: float = 1.25
+    # tts_cache: str = render.DEFAULT_TTS_CACHE  # cleared for a slide when it is re-voiced
 
     @classmethod
     def from_args(cls, a) -> "Options":
@@ -36,15 +38,17 @@ def clip_current(out: Path, manifest: "render.Manifest", slide) -> bool:
     """Is there a clip made from exactly this version of the slide?"""
     e = manifest.data.get(slide.stem, {})
     return (e.get("fingerprint") == slide.fingerprint and "timing" in e  # clips before timing alignment are redone
+            and (e.get("audio") or not slide.notes.strip())              # a narrated slide's clip must have narration
             and (out / e.get("clip", "-")).exists())
 
 
 def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(), deck: Path = None,
-                  on_stage=lambda slide, stage: None):
+                  on_stage=lambda slide, stage, **info: None):
     """Narrate and render each slide. Returns (rendered, failed) lists of slides.
 
     `deck` is the presentation PowerPoint renders from (default: the work copy from the last
-    inspection). `on_stage(slide, stage)` reports progress: narrating, rendering.
+    inspection). `on_stage(slide, stage, **info)` reports progress: narrating, rendering, failed
+    (with `error`).
     """
     out = output_dir(pptx)
     deck = deck or out / ".work" / "deck.pptx"
@@ -53,10 +57,16 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
 
     for s in slides:  # 1. narration: the slow part
         on_stage(s, "narrating")
-        audio[s.number] = render.synthesize(out, s, opts.tts, opts.retries, force=s.number in redo_audio)
-        if s.notes.strip() and audio[s.number] is None:
+        try:
+            audio[s.number] = render.synthesize(out, s, opts.tts, opts.retries, force=s.number in redo_audio)
+        except getattr(render, "TTSFailed", RuntimeError) as e:
+            audio[s.number] = None
             failed.append(s)
-            on_stage(s, "failed")
+            on_stage(s, "failed", error=str(e))
+            continue
+        if s.notes.strip() and audio[s.number] is None:  # never render a narrated slide without its narration
+            failed.append(s)
+            on_stage(s, "failed", error="Narration failed: see presgen.log for the voice's error")
 
     timings = {}
     for s in slides:  # 2. pictures, timed to the real narration
@@ -91,7 +101,9 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
             silent = out / ".work" / f"silent_{s.stem}.mp4"
             render.add_narration(silent, audio[s.number], secs, opts.lead, out / clip, timings[s.number]["factor"])
             silent.unlink(missing_ok=True)
-            manifest.record(s, key, clip, audio[s.number], secs, opts.renderer, timings[s.number])
+            meta = out / f"audio_{s.stem}.json"
+            phrased = json.loads(meta.read_text(encoding="utf-8")).get("phrased") if meta.exists() else False
+            manifest.record(s, key, clip, audio[s.number], secs, opts.renderer, {**timings[s.number], "phrased": phrased})
             manifest.save()
             log.info(f"Slide {s.number}: clip ready ({secs:.1f}s)")
     return [s for s, _, _, _ in plan], failed

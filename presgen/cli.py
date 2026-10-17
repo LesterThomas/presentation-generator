@@ -12,6 +12,7 @@
 """
 
 import argparse
+import faulthandler
 import json
 import logging
 import sys
@@ -81,6 +82,10 @@ def cmd_review(a) -> None:
 
 
 def cmd_serve(a) -> None:
+    # Record native crashes (PowerPoint COM, FFmpeg pipes) that would otherwise end the server silently.
+    global _crash_log
+    _crash_log = open(output_dir(a.deck) / "crash.log", "a", encoding="utf-8")
+    faulthandler.enable(_crash_log)
     gen = None if a.no_auto else AutoGenerator(a.deck, pipeline.Options.from_args(a))
     serve(a.deck, a.port, open_browser=not a.no_open, gen=gen)
 
@@ -179,6 +184,8 @@ def main(argv=None) -> None:
         sp.add_argument("--tts", default=render.DEFAULT_TTS,
                         help="TTS command with {text} and {audio} placeholders (run in the output folder)")
         sp.add_argument("--retries", type=int, default=3, help="TTS attempts per slide")
+        # sp.add_argument("--tts-cache", default=render.DEFAULT_TTS_CACHE,
+        #                 help="the TTS's sentence cache, cleared for a slide when it is re-voiced ('' to leave it)")
         sp.add_argument("--lead", type=float, default=1.0, help="seconds before the narration starts")
         sp.add_argument("--tail", type=float, default=0.75, help="seconds after the narration ends")
         sp.add_argument("--quality", type=int, default=100, help="PowerPoint video quality, 1-100")

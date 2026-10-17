@@ -23,7 +23,10 @@ from .deck import PowerPoint, sha256_bytes, sha256_file, write_atomic
 
 log = logging.getLogger("presgen")
 
-DEFAULT_TTS = r'"D:\Dev\lesterthomas\csm-lester-voice\.venv\Scripts\csm-voice.exe" -f {text} -o {audio}'
+# --candidates 3: csm-voice voices each sentence three times (sampled), cuts each take at its first long
+# pause, and keeps the take closest to the expected length. A single greedy take often drops words or
+# runs on after the sentence.
+DEFAULT_TTS = r'"D:\Dev\lesterthomas\csm-lester-voice\.venv\Scripts\csm-voice.exe" -f {text} -o {audio} --candidates 3'
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 STATUS_IN_PROGRESS, STATUS_QUEUED, STATUS_DONE = 1, 2, 3   # PpMediaTaskStatus
 
@@ -48,7 +51,10 @@ def synthesize(out: Path, slide, tts_cmd: str, retries: int = 3, force: bool = F
     if audio.exists() and audio.stat().st_mtime > text.stat().st_mtime:
         log.info(f"Slide {slide.number}: narration up to date")
         return audio
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    # The voice model is cached locally. Offline mode stops csm-voice contacting huggingface.co on every
+    # run, which fails behind TLS-intercepting antivirus (set HF_HUB_OFFLINE=0 to allow downloads).
+    env = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", **os.environ,
+           "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     cmd = tts_cmd.format(text=text.name, audio=audio.name)
     for attempt in range(1, retries + 1):
         log.info(f"Slide {slide.number}: generating narration (attempt {attempt}/{retries})")
