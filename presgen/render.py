@@ -2,7 +2,8 @@
 
 Pictures come from PowerPoint itself (``Presentation.CreateVideo``), so entrance animations and
 embedded video clips play exactly as in a slide show. Each slide is rendered on its own (all other
-slides hidden), silent, and FFmpeg then adds the narration, starting ``lead`` seconds in. Rendering
+slides hidden), silent. FFmpeg then shifts it to start with the narration, ``lead`` seconds in, and
+stretches it slightly so the builds keep pace with the real voice (see ``timing``). Rendering
 one slide at a time lets unchanged slides be reused and lets approved slides be rendered before the
 rest of the deck is ready.
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-from .deck import PowerPoint, sha256_bytes, sha256_file
+from .deck import PowerPoint, sha256_bytes, sha256_file, write_atomic
 
 log = logging.getLogger("presgen")
 
@@ -66,12 +67,36 @@ def synthesize(out: Path, slide, tts_cmd: str, retries: int = 3, force: bool = F
 # ---------------------------------------------------------------- video
 
 
-def slide_secs(slide, audio, lead: float, tail: float, min_secs: float = 3.0) -> float:
-    """Long enough for the narration, every animation and any embedded clip."""
-    secs = max(min_secs, slide.anim_secs + 0.5)
+def timing(slide, audio, wps: float = 2.5, max_stretch: float = 1.25) -> dict:
+    """Compare the narration the slide was animated for with the real narration.
+
+    Builds are planned at `wps` words per second from the start of the narration (that is how the
+    deck's animations and clips are timed). The real voice is a little faster or slower, so the slide's
+    pictures are stretched by `factor` (voice / planned) to stay in step with it. A factor beyond
+    `max_stretch` is clamped and flagged: that slide's animation should be retimed at source.
+    """
+    words = len(slide.notes.split())
+    if not audio or not words:
+        return {"planned": 0.0, "voice": 0.0, "factor": 1.0, "clamped": False}
+    planned = words / wps
+    voice = wav_secs(audio)
+    raw = voice / planned
+    factor = min(max(raw, 1 / max_stretch), max_stretch)
+    return {"planned": round(planned, 2), "voice": round(voice, 2), "factor": round(factor, 3),
+            "clamped": abs(raw - factor) > 1e-3}
+
+
+def slide_secs(slide, audio, lead: float, tail: float, factor: float = 1.0, min_secs: float = 3.0) -> float:
+    """Long enough for the narration, every (stretched) animation and any embedded clip."""
+    secs = max(min_secs, lead + slide.anim_secs * factor + 0.5)
     if audio:
         secs = max(secs, lead + wav_secs(audio) + tail)
     return round(secs, 2)
+
+
+def render_secs(slide_total: float, lead: float, factor: float) -> float:
+    """How long PowerPoint must render so that, once shifted by `lead` and stretched, it fills the slide."""
+    return round((slide_total - lead) / factor + 0.2, 2)
 
 
 def _ffmpeg(*args) -> None:
@@ -140,18 +165,27 @@ def still_video(png: Path, secs: float, mp4: Path, fps: int = 30) -> None:
             "-pix_fmt", "yuv420p", "-vf", "scale=1920:1080", str(mp4))
 
 
-def add_narration(silent: Path, audio, secs: float, lead: float, mp4: Path) -> None:
-    """Mux the narration in (delayed by `lead`), mixed with any sound the slide already has."""
+def add_narration(silent: Path, audio, secs: float, lead: float, mp4: Path, factor: float = 1.0,
+                  fps: int = 30) -> None:
+    """Align the pictures with the narration and mux them together.
+
+    The rendered slide starts `lead` seconds in, together with the narration (the first frame is held
+    until then), and is stretched by `factor` so its builds keep pace with the real voice. Any sound
+    the slide already has is stretched to match and mixed in.
+    """
     mp4.parent.mkdir(parents=True, exist_ok=True)
     narration = (["-i", str(audio)] if audio else ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
-    chain = f"[1:a]aresample=48000,adelay={int(lead * 1000)}:all=1,apad[n]"
+    ms = int(lead * 1000)
+    chain = (f"[0:v]setpts=PTS*{factor},tpad=start_duration={lead}:start_mode=clone,fps={fps},format=yuv420p[vid];"
+             f"[1:a]aresample=48000,adelay={ms}:all=1,apad[n]")
     if _has_audio(silent):
-        chain += ";[0:a]aresample=48000,apad[v];[n][v]amix=inputs=2:normalize=0[a]"
+        chain += (f";[0:a]aresample=48000,atempo={1 / factor:.5f},adelay={ms}:all=1,apad[v];"
+                  "[n][v]amix=inputs=2:normalize=0[a]")
     else:
         chain += ";[n]anull[a]"
-    _ffmpeg("-i", str(silent), *narration, "-filter_complex", chain, "-map", "0:v", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-t", f"{secs}",
-            "-movflags", "+faststart", str(mp4))
+    _ffmpeg("-i", str(silent), *narration, "-filter_complex", chain, "-map", "[vid]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-t", f"{secs}", "-movflags", "+faststart", str(mp4))
 
 
 def concat(clips: list, mp4: Path) -> None:
@@ -184,17 +218,18 @@ class Manifest:
         self.path = out / "render.json"
         self.data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
-    def key(self, slide, audio, renderer: str, secs: float, lead: float) -> str:
+    def key(self, slide, audio, renderer: str, secs: float, lead: float, factor: float = 1.0) -> str:
         return sha256_bytes(json.dumps([slide.fingerprint, sha256_file(audio) if audio else None,
-                                        renderer, secs, lead]).encode())[:16]
+                                        renderer, secs, lead, factor, 2]).encode())[:16]
 
     def current(self, out: Path, slide, key: str) -> bool:
         e = self.data.get(slide.stem, {})
         return e.get("key") == key and (out / e.get("clip", "-")).exists()
 
-    def record(self, slide, key, clip, audio, secs, renderer) -> None:
+    def record(self, slide, key, clip, audio, secs, renderer, timing=None) -> None:
         self.data[slide.stem] = {"key": key, "fingerprint": slide.fingerprint, "clip": clip,
-                                 "audio": audio.name if audio else None, "secs": secs, "renderer": renderer}
+                                 "audio": audio.name if audio else None, "secs": secs, "renderer": renderer,
+                                 "timing": timing or {}}
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
+        write_atomic(self.path, json.dumps(self.data, indent=2) + "\n")

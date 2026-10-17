@@ -1,0 +1,137 @@
+"""Narrate and render slides, and join the clips into the final video.
+
+Shared by `presgen.py generate` (a batch from the command line) and the review server's background
+generator (one slide at a time, as soon as it is approved).
+"""
+
+import logging
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import render
+from .deck import load_slides
+from .review import ReviewState, output_dir
+
+log = logging.getLogger("presgen")
+
+
+@dataclass
+class Options:
+    renderer: str = "powerpoint"
+    tts: str = render.DEFAULT_TTS
+    retries: int = 3
+    lead: float = 1.0
+    tail: float = 0.75
+    quality: int = 100
+    wps: float = 2.5          # narration speed the deck's animations were planned for
+    max_stretch: float = 1.25
+
+    @classmethod
+    def from_args(cls, a) -> "Options":
+        return cls(**{k: getattr(a, k) for k in cls.__dataclass_fields__ if hasattr(a, k)})
+
+
+def clip_current(out: Path, manifest: "render.Manifest", slide) -> bool:
+    """Is there a clip made from exactly this version of the slide?"""
+    e = manifest.data.get(slide.stem, {})
+    return (e.get("fingerprint") == slide.fingerprint and "timing" in e  # clips before timing alignment are redone
+            and (out / e.get("clip", "-")).exists())
+
+
+def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(), deck: Path = None,
+                  on_stage=lambda slide, stage: None):
+    """Narrate and render each slide. Returns (rendered, failed) lists of slides.
+
+    `deck` is the presentation PowerPoint renders from (default: the work copy from the last
+    inspection). `on_stage(slide, stage)` reports progress: narrating, rendering.
+    """
+    out = output_dir(pptx)
+    deck = deck or out / ".work" / "deck.pptx"
+    audio, failed, plan, jobs = {}, [], [], []
+    manifest = render.Manifest(out)
+
+    for s in slides:  # 1. narration: the slow part
+        on_stage(s, "narrating")
+        audio[s.number] = render.synthesize(out, s, opts.tts, opts.retries, force=s.number in redo_audio)
+        if s.notes.strip() and audio[s.number] is None:
+            failed.append(s)
+            on_stage(s, "failed")
+
+    timings = {}
+    for s in slides:  # 2. pictures, timed to the real narration
+        if s in failed:
+            continue
+        t = render.timing(s, audio[s.number], opts.wps, opts.max_stretch)
+        timings[s.number] = t
+        if t["voice"]:
+            log.info(f"Slide {s.number}: narration {t['voice']:.1f}s, planned {t['planned']:.1f}s"
+                     f" -> animation timing x{t['factor']:.2f}"
+                     + ("  (CLAMPED: retime this slide's animation at source)" if t["clamped"] else ""))
+        secs = render.slide_secs(s, audio[s.number], opts.lead, opts.tail, t["factor"])
+        key = manifest.key(s, audio[s.number], opts.renderer, secs, opts.lead, t["factor"])
+        clip = f"clips/clip_{s.stem}.mp4"
+        plan.append((s, secs, key, clip))
+        if manifest.current(out, s, key):
+            log.info(f"Slide {s.number}: clip up to date")
+            continue
+        jobs.append((s, render.render_secs(secs, opts.lead, t["factor"]), out / ".work" / f"silent_{s.stem}.mp4"))
+    for s, _, _ in jobs:
+        on_stage(s, "rendering")
+    if jobs:
+        if opts.renderer == "powerpoint":
+            render.powerpoint_videos(deck, jobs, quality=opts.quality)
+        else:
+            for s, rsecs, silent in jobs:
+                render.still_video(out / f"slide_{s.stem}.png", rsecs, silent)
+
+    fresh = {s.number for s, _, _ in jobs}  # 3. sound
+    for s, secs, key, clip in plan:
+        if s.number in fresh:
+            silent = out / ".work" / f"silent_{s.stem}.mp4"
+            render.add_narration(silent, audio[s.number], secs, opts.lead, out / clip, timings[s.number]["factor"])
+            silent.unlink(missing_ok=True)
+            manifest.record(s, key, clip, audio[s.number], secs, opts.renderer, timings[s.number])
+            manifest.save()
+            log.info(f"Slide {s.number}: clip ready ({secs:.1f}s)")
+    return [s for s, _, _, _ in plan], failed
+
+
+def build_final(pptx: Path, partial: bool = False, ignore_approvals: bool = False):
+    """Join the clips into the final video once every visible slide is approved and rendered.
+
+    Returns the video's path, or None (with the reason logged) when the deck isn't ready.
+    """
+    out = output_dir(pptx)
+    state = ReviewState(pptx)
+    manifest = render.Manifest(out)
+    visible = [s for s in load_slides(out) if not s.hidden]
+    ready = [s for s in visible if clip_current(out, manifest, s) and (ignore_approvals or state.is_approved(s))]
+    missing = [s for s in visible if s not in ready]
+    final = out / f"{out.name}_video.mp4"
+    if (missing and not partial) or not ready:
+        if final.exists() and missing:
+            log.info("The existing final video is out of date")
+        log.info(f"Final video not built: {len(missing)} slide(s) not approved or not rendered yet: "
+                 + ", ".join(str(s.number) for s in missing))
+        return None
+    built = {s.stem: s.fingerprint for s in ready}
+    if manifest.data.get("_final") == built and final.exists():
+        log.info(f"Final video up to date: {final}")
+        return final
+    render.concat([out / manifest.data[s.stem]["clip"] for s in ready], final)
+    secs = [manifest.data[s.stem]["secs"] for s in ready]
+    (out / f"{out.name}_chapters.txt").write_text(render.chapters(ready, secs), encoding="utf-8")
+    manifest.data["_final"] = built
+    manifest.save()
+    total = sum(secs)
+    log.info(f"Final video: {final}  ({len(ready)} slides, {int(total // 60)}:{int(total % 60):02d})")
+    return final
+
+
+def snapshot(out: Path, name: str) -> Path:
+    """A private copy of the work deck, so a concurrent `refresh` can replace the work copy."""
+    src = out / ".work" / "deck.pptx"
+    dst = out / ".work" / f"{name}.pptx"
+    shutil.copy2(src, dst)
+    return dst

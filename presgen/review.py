@@ -16,11 +16,13 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .deck import load_slides
+from .deck import load_slides, write_atomic
 
 log = logging.getLogger("presgen")
 
 ACTIONS = {"approve": "approved", "changes": "changes-requested", "reset": "pending"}
+PAGE_ACTIONS = set(ACTIONS)                 # what the review page may do
+REPLY = "reply"                             # a note back to the reviewer; status unchanged
 PAGE_TEMPLATE = Path(__file__).with_name("review_page.html")
 _lock = threading.Lock()
 
@@ -46,7 +48,7 @@ class ReviewState:
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_atomic(self.path, json.dumps(self.data, indent=2, ensure_ascii=False) + "\n")
 
     def entry(self, slide_id) -> dict:
         return self.data["slides"].setdefault(str(slide_id), {"status": "pending", "history": []})
@@ -65,13 +67,17 @@ class ReviewState:
         self.save()
 
     def status(self, slide) -> str:
-        """approved | changed | changes-requested | pending | hidden"""
+        """approved | changed | changes-requested | updated | pending | hidden"""
         if slide.hidden:
             return "hidden"
         e = self.data["slides"].get(str(slide.slide_id), {})
         st = e.get("status", "pending")
         if st == "approved" and e.get("approved_fingerprint") != slide.fingerprint:
             return "changed"
+        asked = e.get("requested_fingerprint") or next(
+            (h["fingerprint"] for h in reversed(e.get("history", [])) if h["action"] == "changes"), None)
+        if st == "changes-requested" and asked not in (None, slide.fingerprint):
+            return "updated"  # the slide changed after the reviewer asked for changes
         return st
 
     def is_approved(self, slide) -> bool:
@@ -83,13 +89,21 @@ class ReviewState:
         if not slide.fingerprint:
             raise ValueError(f"slide {slide.number} has not been inspected yet: run `review` first")
         e = self.entry(slide.slide_id)
+        if action == REPLY:
+            e["reply"] = {"at": _now(), "text": comment}
+            e["history"].append({"at": e["reply"]["at"], "action": REPLY, "by": by,
+                                 "comment": comment, "fingerprint": slide.fingerprint})
+            return
+        e.pop("reply", None)
         e["status"] = ACTIONS[action]
         e["comment"] = comment
         e["updated_at"] = _now()
+        e.pop("approved_fingerprint", None)
+        e.pop("requested_fingerprint", None)
         if action == "approve":
             e["approved_fingerprint"] = slide.fingerprint
-        else:
-            e.pop("approved_fingerprint", None)
+        elif action == "changes":
+            e["requested_fingerprint"] = slide.fingerprint
         e["history"].append({"at": e["updated_at"], "action": action, "by": by,
                              "comment": comment, "fingerprint": slide.fingerprint})
 
@@ -124,15 +138,28 @@ def change_status(pptx: Path, spec: str, action: str, comment: str = "", by: str
         for s in chosen:
             state.apply(s, action, comment, by)
         state.save()
+        event = {"at": _now(), "action": action, "slides": [s.number for s in chosen],
+                 "titles": [s.title for s in chosen], "comment": comment, "by": by}
+        with open(events_path(pptx), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
         return chosen
+
+
+def events_path(pptx: Path) -> Path:
+    """One JSON line per review action: what a watcher (e.g. Claude) follows to act on requests."""
+    return output_dir(pptx) / "review-events.jsonl"
 
 
 # ---------------------------------------------------------------- page data
 
 
-def page_data(pptx: Path) -> dict:
-    """Everything the review page shows, built from the output folder and the review state."""
+def page_data(pptx: Path, gen=None) -> dict:
+    """Everything the review page shows, built from the output folder and the review state.
+
+    `gen` is the review server's AutoGenerator, if any: its job progress is included.
+    """
     out = output_dir(pptx)
+    live = gen.snapshot() if gen else {"jobs": {}, "final": {}}
     state = ReviewState(pptx)
     render = {}
     if (out / "render.json").exists():
@@ -142,22 +169,27 @@ def page_data(pptx: Path) -> dict:
     for s in slides:
         e = state.data["slides"].get(str(s.slide_id), {})
         r = render.get(s.stem, {})
-        clip = r.get("clip") if r.get("fingerprint") == s.fingerprint and (out / r.get("clip", "-")).exists() else None
+        clip = r.get("clip") if (r.get("fingerprint") == s.fingerprint and "timing" in r
+                                 and (out / r.get("clip", "-")).exists()) else None
         preview = f"previews/slide_{s.stem}.mp4"
         rows.append({
             "number": s.number, "slideId": s.slide_id, "title": s.title, "notes": s.notes,
             "hidden": s.hidden, "status": state.status(s), "comment": e.get("comment", ""),
-            "updatedAt": e.get("updated_at", ""), "history": e.get("history", [])[-5:],
+            "updatedAt": e.get("updated_at", ""), "history": e.get("history", [])[-6:],
+            "reply": e.get("reply"),
             "image": f"slide_{s.stem}.png" if not s.hidden else None,
             "preview": preview if (out / preview).exists() else None,
             "clip": clip, "audio": r.get("audio") if clip else None,
             "secs": r.get("secs") if clip else None,
+            "timing": r.get("timing") if clip else None,
+            "job": live["jobs"].get(s.stem),
         })
     final = out / f"{out.name}_video.mp4"
     built = render.get("_final", {})
     current = {s.stem: s.fingerprint for s in slides if not s.hidden}
     return {"deck": pptx.name, "slides": rows, "inspectedAt": state.data.get("inspected_at", ""),
-            "video": final.name if final.exists() else None, "videoCurrent": built == current}
+            "video": final.name if final.exists() else None, "videoCurrent": built == current,
+            "auto": gen is not None, "final": live["final"]}
 
 
 def write_page(pptx: Path) -> Path:
@@ -172,8 +204,11 @@ def write_page(pptx: Path) -> Path:
 # ---------------------------------------------------------------- server
 
 
-def serve(pptx: Path, port: int = 8765, open_browser: bool = True) -> None:
-    """Serve the review page with live approve / request-changes buttons until Ctrl+C."""
+def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> None:
+    """Serve the review page with live review controls until Ctrl+C.
+
+    With `gen` (an AutoGenerator), approving a slide narrates and renders it straight away.
+    """
     out = output_dir(pptx)
 
     class Handler(SimpleHTTPRequestHandler):
@@ -194,7 +229,7 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True) -> None:
 
         def do_GET(self):
             if self.path.startswith("/api/state"):
-                return self._json(200, page_data(pptx))
+                return self._json(200, page_data(pptx, gen))
             if self.path in ("/", "/index.html"):
                 self.path = "/review.html"
             if "Range" in self.headers:
@@ -243,17 +278,28 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True) -> None:
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 action = body.get("action")
-                if action not in ACTIONS:
+                if action in ("revoice", "retry"):
+                    if not gen:
+                        raise ValueError("auto-generation is off: use `presgen.py generate`")
+                    for n in str(body["slides"]).split(","):
+                        gen.request(f"{int(n):02d}", revoice=action == "revoice")
+                    log.info(f"Review page: {action} slide(s) {body['slides']}")
+                    return self._json(200, page_data(pptx, gen))
+                if action not in PAGE_ACTIONS:
                     raise ValueError(f"unknown action {action!r}")
                 chosen = change_status(pptx, str(body["slides"]), action, body.get("comment", ""), by="review page")
                 log.info(f"Review page: {action} slide(s) {', '.join(str(s.number) for s in chosen)}"
                          + (f" - {body.get('comment')}" if body.get("comment") else ""))
                 write_page(pptx)
-                return self._json(200, page_data(pptx))
+                if gen:
+                    gen.poke()
+                return self._json(200, page_data(pptx, gen))
             except Exception as e:
                 return self._json(400, {"error": str(e)})
 
     write_page(pptx)
+    if gen:
+        gen.start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://localhost:{port}/"
     log.info(f"Review page: {url}  (Ctrl+C to stop)")

@@ -117,6 +117,21 @@ def _media_secs(slide) -> float:
     return secs
 
 
+def write_atomic(path: Path, text: str, wait: float = 5) -> None:
+    """Replace a file in one step (the review server may be reading it), retrying while it is busy."""
+    import time
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    deadline = time.time() + wait
+    while True:
+        try:
+            return tmp.replace(path)
+        except PermissionError:
+            if time.time() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _write_if_changed(path: Path, text: str) -> None:
     """Keep the file (and its timestamp, which the audio cache relies on) when the text is unchanged."""
     if path.exists() and path.read_text(encoding="utf-8") == text:
@@ -176,7 +191,7 @@ def inspect_deck(pptx: Path, out: Path) -> list:
         finally:
             pres.Close()
 
-    (out / "slides.json").write_text(json.dumps([asdict(s) for s in slides], indent=2), encoding="utf-8")
+    write_atomic(out / "slides.json", json.dumps([asdict(s) for s in slides], indent=2))
     visible = [s for s in slides if not s.hidden]
     log.info(f"Inspected {len(slides)} slides ({len(visible)} visible)")
     return slides

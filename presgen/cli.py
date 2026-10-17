@@ -1,9 +1,12 @@
 """presgen: review a narrated deck slide by slide, then turn the approved slides into a video.
 
-    uv run presgen.py review   DECK.pptx            # stills + silent previews, opens the review page
+    uv run presgen.py review   DECK.pptx            # stills + previews, opens the review page;
+                                                    # approving a slide narrates and renders it
     uv run presgen.py approve  DECK.pptx 1-4,7      # or approve on the review page
     uv run presgen.py changes  DECK.pptx 5 -m "..." # request changes, with a comment
     uv run presgen.py status   DECK.pptx
+    uv run presgen.py reply    DECK.pptx 5 -m "..." # a note back to the reviewer, shown on the page
+    uv run presgen.py refresh  DECK.pptx            # after a rebuild: the open page updates itself
     uv run presgen.py generate DECK.pptx            # narration + clips for approved slides, then the video
     uv run presgen.py run      DECK.pptx            # everything, ignoring approvals (the old behaviour)
 """
@@ -14,9 +17,10 @@ import logging
 import sys
 from pathlib import Path
 
-from . import render
+from . import pipeline, render
+from .autogen import AutoGenerator
 from .deck import inspect_deck, load_slides
-from .review import (ACTIONS, ReviewState, change_status, output_dir, parse_slides, serve,
+from .review import (ACTIONS, REPLY, ReviewState, change_status, output_dir, parse_slides, serve,
                      state_path, write_page)
 
 log = logging.getLogger("presgen")
@@ -73,19 +77,30 @@ def cmd_review(a) -> None:
     if a.no_serve:
         log.info(f"Review page (read-only): {page}")
         return
-    serve(a.deck, a.port, open_browser=not a.no_open)
+    cmd_serve(a)
 
 
 def cmd_serve(a) -> None:
-    serve(a.deck, a.port, open_browser=not a.no_open)
+    gen = None if a.no_auto else AutoGenerator(a.deck, pipeline.Options.from_args(a))
+    serve(a.deck, a.port, open_browser=not a.no_open, gen=gen)
 
 
 def cmd_change(a) -> None:
-    if a.cmd == "changes" and not a.message:
-        raise SystemExit("`changes` needs a comment: -m \"what to change\"")
-    chosen = change_status(a.deck, a.slides, a.cmd, a.message or "")
+    if a.cmd in ("changes", REPLY) and not a.message:
+        raise SystemExit(f"`{a.cmd}` needs a message: -m \"...\"")
+    chosen = change_status(a.deck, a.slides, a.cmd, a.message or "", by=a.by)
     write_page(a.deck)
-    log.info(f"{ACTIONS[a.cmd]}: slide(s) {', '.join(str(s.number) for s in chosen)}")
+    log.info(f"{ACTIONS.get(a.cmd, 'replied')}: slide(s) {', '.join(str(s.number) for s in chosen)}")
+    if a.cmd != REPLY:
+        print_status(a.deck)
+
+
+def cmd_refresh(a) -> None:
+    """Re-read the deck after it was rebuilt; an open review page picks the changes up by itself."""
+    out, slides = inspect(a.deck)
+    if not a.no_previews:
+        previews(a.deck, out, slides)
+    write_page(a.deck)
     print_status(a.deck)
 
 
@@ -130,73 +145,15 @@ def cmd_generate(a, ignore_approvals: bool = False) -> None:
     if skipped:
         log.info("Not approved, skipped: " + ", ".join(f"{s.number} ({state.status(s)})" for s in skipped))
 
-    # 1. narration (the slow part: run only for approved slides)
-    audio, failed = {}, []
-    for s in todo:
-        audio[s.number] = render.synthesize(out, s, a.tts, a.retries, force=s.number in redo)
-        if s.notes.strip() and audio[s.number] is None:
-            failed.append(s)
-
-    # 2. pictures: PowerPoint renders each slide alone; unchanged clips are reused
-    manifest = render.Manifest(out)
-    jobs, plan = [], []
-    for s in todo:
-        if s in failed:
-            continue
-        secs = render.slide_secs(s, audio[s.number], a.lead, a.tail)
-        key = manifest.key(s, audio[s.number], a.renderer, secs, a.lead)
-        clip = f"clips/clip_{s.stem}.mp4"
-        plan.append((s, secs, key, clip))
-        if manifest.current(out, s, key):
-            log.info(f"Slide {s.number}: clip up to date")
-            continue
-        jobs.append((s, secs, out / ".work" / f"silent_{s.stem}.mp4"))
-    if jobs:
-        if a.renderer == "powerpoint":
-            render.powerpoint_videos(out / ".work" / "deck.pptx", jobs, quality=a.quality)
-        else:
-            for s, secs, silent in jobs:
-                render.still_video(out / f"slide_{s.stem}.png", secs, silent)
-    fresh = {s.number for s, _, _ in jobs}
-    for s, secs, key, clip in plan:
-        if s.number in fresh:
-            silent = out / ".work" / f"silent_{s.stem}.mp4"
-            render.add_narration(silent, audio[s.number], secs, a.lead, out / clip)
-            silent.unlink(missing_ok=True)
-            manifest.record(s, key, clip, audio[s.number], secs, a.renderer)
-            manifest.save()
-            log.info(f"Slide {s.number}: clip ready ({secs:.1f}s)")
-    manifest.save()
+    _, failed = pipeline.render_slides(pptx, todo, pipeline.Options.from_args(a), redo)
     write_page(pptx)
-
-    # 3. the whole video, once every visible slide is approved and rendered
-    ready = {s.number: (secs, clip) for s, secs, _, clip in plan}
-    for s in visible:
-        e = manifest.data.get(s.stem, {})
-        if s.number not in ready and e.get("fingerprint") == s.fingerprint and state.is_approved(s) \
-                and (out / e.get("clip", "-")).exists():
-            ready[s.number] = (e["secs"], e["clip"])
-    missing = [s for s in visible if s.number not in ready]
     if failed:
         log.error("Narration failed for slide(s) " + ", ".join(str(s.number) for s in failed)
                   + ": run `generate` again to retry")
     if a.no_build:
         log.info("Skipping the final video (--no-build)")
-    elif missing and not a.partial:
-        if (out / f"{out.name}_video.mp4").exists():
-            log.warning("The existing final video is out of date")
-        log.info(f"Final video not built: {len(missing)} slide(s) not approved or not rendered yet: "
-                 + ", ".join(str(s.number) for s in missing) + "  (use --partial to build from the rest)")
     else:
-        parts = [s for s in visible if s.number in ready]
-        final = out / f"{out.name}_video.mp4"
-        render.concat([out / ready[s.number][1] for s in parts], final)
-        secs = [ready[s.number][0] for s in parts]
-        (out / f"{out.name}_chapters.txt").write_text(render.chapters(parts, secs), encoding="utf-8")
-        manifest.data["_final"] = {s.stem: s.fingerprint for s in parts}
-        manifest.save()
-        total = sum(secs)
-        log.info(f"Final video: {final}  ({len(parts)} slides, {int(total // 60)}:{int(total % 60):02d})")
+        pipeline.build_final(pptx, partial=a.partial, ignore_approvals=ignore_approvals)
         write_page(pptx)
     if failed:
         raise SystemExit(1)
@@ -216,26 +173,51 @@ def main(argv=None) -> None:
     def deck_arg(sp):
         sp.add_argument("deck", type=Path, help="the .pptx file")
 
+    def gen_args(sp):
+        sp.add_argument("--renderer", choices=["powerpoint", "still"], default="powerpoint",
+                        help="powerpoint plays animations and clips; still shows each slide's final state")
+        sp.add_argument("--tts", default=render.DEFAULT_TTS,
+                        help="TTS command with {text} and {audio} placeholders (run in the output folder)")
+        sp.add_argument("--retries", type=int, default=3, help="TTS attempts per slide")
+        sp.add_argument("--lead", type=float, default=1.0, help="seconds before the narration starts")
+        sp.add_argument("--tail", type=float, default=0.75, help="seconds after the narration ends")
+        sp.add_argument("--quality", type=int, default=100, help="PowerPoint video quality, 1-100")
+        sp.add_argument("--wps", type=float, default=2.5,
+                        help="words per second the animations were planned for (timing is matched to the voice)")
+        sp.add_argument("--max-stretch", type=float, default=1.25,
+                        help="largest timing stretch or squeeze; beyond it the slide is flagged for retiming")
+
     sp = sub.add_parser("review", help="export stills and previews, then open the review page")
     deck_arg(sp)
     sp.add_argument("--port", type=int, default=8765)
     sp.add_argument("--no-serve", action="store_true", help="write review.html and exit (no buttons)")
     sp.add_argument("--no-open", action="store_true", help="don't open a browser")
     sp.add_argument("--no-previews", action="store_true", help="skip the silent PowerPoint previews")
+    sp.add_argument("--no-auto", action="store_true", help="don't narrate and render slides when approved")
+    gen_args(sp)
     sp.set_defaults(func=cmd_review)
 
     sp = sub.add_parser("serve", help="serve the review page again without re-inspecting the deck")
     deck_arg(sp)
     sp.add_argument("--port", type=int, default=8765)
     sp.add_argument("--no-open", action="store_true")
+    sp.add_argument("--no-auto", action="store_true", help="don't narrate and render slides when approved")
+    gen_args(sp)
     sp.set_defaults(func=cmd_serve)
 
+    sp = sub.add_parser("refresh", help="re-read the deck after a rebuild (a running review page updates itself)")
+    deck_arg(sp)
+    sp.add_argument("--no-previews", action="store_true")
+    sp.set_defaults(func=cmd_refresh)
+
     for name, text in (("approve", "approve slides"), ("changes", "request changes to slides"),
-                       ("reset", "set slides back to pending")):
+                       ("reset", "set slides back to pending"),
+                       (REPLY, "post a note to the reviewer on the review page (status unchanged)")):
         sp = sub.add_parser(name, help=text)
         deck_arg(sp)
         sp.add_argument("slides", help="slide numbers: 3, 1-4,7 or all")
-        sp.add_argument("-m", "--message", help="comment (required for `changes`)")
+        sp.add_argument("-m", "--message", help="comment (required for `changes` and `reply`)")
+        sp.add_argument("--by", default="cli", help="who is acting (shown in the history)")
         sp.set_defaults(func=cmd_change)
 
     sp = sub.add_parser("status", help="show each slide's review status")
@@ -249,14 +231,7 @@ def main(argv=None) -> None:
         deck_arg(sp)
         sp.add_argument("--slides", help="only these slides (default: all approved)")
         sp.add_argument("--redo-audio", metavar="SLIDES", help="regenerate narration for these slides")
-        sp.add_argument("--renderer", choices=["powerpoint", "still"], default="powerpoint",
-                        help="powerpoint plays animations and clips; still shows each slide's final state")
-        sp.add_argument("--tts", default=render.DEFAULT_TTS,
-                        help="TTS command with {text} and {audio} placeholders (run in the output folder)")
-        sp.add_argument("--retries", type=int, default=3, help="TTS attempts per slide")
-        sp.add_argument("--lead", type=float, default=1.0, help="seconds before the narration starts")
-        sp.add_argument("--tail", type=float, default=0.75, help="seconds after the narration ends")
-        sp.add_argument("--quality", type=int, default=100, help="PowerPoint video quality, 1-100")
+        gen_args(sp)
         sp.add_argument("--partial", action="store_true", help="build the video from whatever is ready")
         sp.add_argument("--no-build", action="store_true", help="make the clips but not the final video")
         sp.set_defaults(func=func)
