@@ -1,12 +1,12 @@
-"""Make a manual recording sound like the generated narration: matched tone, level and loudness.
+"""Make a manual recording sound like the generated narration: matched tone and loudness.
 
 The reference is the deck's generated narration (audio_NN.wav that is not someone's recording). From it
 we take the average spectral shape (octave bands, speech frames only) and the integrated loudness. A
 recording is then
-  1. cleaned: rumble below 80 Hz removed, light broadband noise reduction,
-  2. equalised: per-band gains that move its spectral shape towards the reference (at most +/-8 dB),
-  3. levelled: gentle compression, so loud and quiet words sit closer together, as in the voice,
-  4. normalised to the reference loudness (EBU R128), with a -1.5 dBTP ceiling.
+  1. equalised: per-band gains that move its spectral shape towards the reference (at most +/-8 dB),
+  2. turned up or down by one fixed gain to the reference loudness (EBU R128).
+No compression, noise reduction or filtering: those were tried and the reviewer preferred the recording
+with only EQ and a fixed gain (2026-10-17).
 """
 
 import json
@@ -104,17 +104,17 @@ def match(src: Path, dst: Path, out: Path) -> dict:
     gains[(rec < -150) | (ref < -150)] = 0.0
     gains = np.convolve(np.pad(gains, 1, mode="edge"), [0.25, 0.5, 0.25], mode="valid")  # smooth neighbouring bands
     eq = ";".join(f"entry({f},{g:.1f})" for f, g in zip(BANDS, gains))
-    chain = ",".join([
-        "highpass=f=80",
-        "afftdn=nf=-30",
-        f"firequalizer=gain_entry='{eq}'",
-        "acompressor=threshold=-24dB:ratio=3:attack=5:release=150:makeup=2",
-        f"loudnorm=I={prof['lufs']}:LRA=7:TP=-1.5",
-        "aresample=24000",
-    ])
-    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af", chain,
-                        "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(dst)], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ValueError(f"could not process the recording: {r.stderr.strip()[-200:]}")
-    return {"eq_db": [round(float(g), 1) for g in gains], "lufs_target": prof["lufs"],
+    eqd = dst.with_name(dst.stem + ".eq.wav")
+
+    def ffmpeg(inp, af, outp):
+        r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(inp), "-af", af,
+                            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(outp)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ValueError(f"could not process the recording: {r.stderr.strip()[-200:]}")
+
+    ffmpeg(src, f"firequalizer=gain_entry='{eq}'", eqd)          # 1. EQ towards the voice
+    gain = round(prof["lufs"] - loudness(eqd), 1)                  # 2. one fixed gain to its loudness
+    ffmpeg(eqd, f"volume={gain}dB", dst)
+    eqd.unlink(missing_ok=True)
+    return {"eq_db": [round(float(g), 1) for g in gains], "gain_db": gain, "lufs_target": prof["lufs"],
             "lufs_before": loudness(src), "lufs_after": loudness(dst)}

@@ -6,6 +6,9 @@ generator (one slide at a time, as soon as it is approved).
 
 import json
 import logging
+import os
+import random
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +35,31 @@ class Options:
     @classmethod
     def from_args(cls, a) -> "Options":
         return cls(**{k: getattr(a, k) for k in cls.__dataclass_fields__ if hasattr(a, k)})
+
+
+VOICE_CACHE = Path(r"D:\Dev\lesterthomas\csm-lester-voice\cache")  # csm-voice's per-sentence takes
+
+
+def forget_voice_takes(text: str, cache: Path = VOICE_CACHE) -> int:
+    """Delete csm-voice's cached takes of these sentences, in every cache folder, so they are voiced afresh.
+
+    csm-voice names a take <first three words, sanitised>_<sha256>.wav. Matching on the first three words
+    can also drop another sentence that starts the same way; that only costs a retake.
+    """
+    if not cache.is_dir():
+        return 0
+    removed = 0
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text.strip()):
+        words = sentence.split()
+        if not words:
+            continue
+        stem = "".join(c if c.isalnum() or c == "_" else "_" for c in "_".join(words[:3])[:50])
+        for folder in [cache, *[d for d in cache.iterdir() if d.is_dir()]]:
+            for f in folder.glob(f"{stem}_*.wav"):
+                if re.fullmatch(re.escape(stem) + r"_[0-9a-f]{64}\.wav", f.name):
+                    f.unlink(missing_ok=True)
+                    removed += 1
+    return removed
 
 
 def audio_newer(out: Path, e: dict) -> bool:
@@ -64,8 +92,15 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
 
     for s in slides:  # 1. narration: the slow part
         on_stage(s, "narrating")
+        tts = opts.tts
+        if s.number in redo_audio:
+            # Re-voice: a genuinely new take. Forget the voice's cached takes of this slide's sentences and
+            # sample with a new seed (the same seed and text would give the same take again).
+            n = forget_voice_takes(s.notes)
+            tts = f"{opts.tts} --seed {random.randint(1, 10**6)}"
+            log.info(f"Slide {s.number}: re-voicing with a new seed ({n} cached sentence takes cleared)")
         try:
-            audio[s.number] = render.synthesize(out, s, opts.tts, opts.retries, force=s.number in redo_audio)
+            audio[s.number] = render.synthesize(out, s, tts, opts.retries, force=s.number in redo_audio)
         except getattr(render, "TTSFailed", RuntimeError) as e:
             audio[s.number] = None
             failed.append(s)
@@ -90,6 +125,9 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
         clip = f"clips/clip_{s.stem}.mp4"
         plan.append((s, secs, key, clip))
         if manifest.current(out, s, key):
+            e = manifest.data.get(s.stem, {})
+            if audio_newer(out, e):  # narration rewritten with identical audio: the clip is still right
+                os.utime(out / e["clip"])
             log.info(f"Slide {s.number}: clip up to date")
             continue
         jobs.append((s, render.render_secs(secs, opts.lead, t["factor"]), out / ".work" / f"silent_{s.stem}.mp4"))

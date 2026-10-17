@@ -45,12 +45,13 @@ http://localhost:8765. For each slide the page shows:
   Progress shows on the page: queued, narrating, rendering, then "narrated clip ready".
 - the clip's timing: the real narration length, the planned length, and how much the animation was
   stretched to match. A slide that needs more than ×1.25 is flagged for re-timing at source.
-- **Re-voice** (a fresh take of the narration) and **Retry** (after a failure),
+- **Re-voice** (a genuinely new take: the slide's sentences are cleared from csm-voice's cache and
+  sampled with a new random seed, `--seed`) and **Retry** (after a failure),
 - **🎙 Record narration**: record the slide in your own voice (record, stop, listen, then use it,
   record again or discard). The upload is kept in `recordings/`, trimmed, and **matched to the
-  generated voice**: rumble filter and light noise reduction, an EQ that moves its tone towards the
-  voice's average spectrum (octave bands, at most ±8 dB), gentle compression, and loudness
-  normalisation to the voice's level (EBU R128). The voice profile comes from the deck's generated
+  generated voice**: an EQ that moves its tone towards the voice's average spectrum (octave bands, at
+  most ±8 dB), then one fixed gain to the voice's loudness (EBU R128). No compression or noise
+  reduction: in listening tests they made recordings sound worse. The voice profile comes from the deck's generated
   narration (`voice_profile.json`). `presgen.py rematch DECK` re-processes existing recordings.
 - a **Narration validated** toggle, for when you've listened to the narrated clip and are happy with
   it. It applies to that exact clip: if the clip is rebuilt, the slide is unvalidated again.

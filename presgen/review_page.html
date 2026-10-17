@@ -114,6 +114,7 @@
     <option value="approved">Approved</option>
     <option value="changes-requested">Changes requested</option>
     <option value="updated">Updated for you</option>
+    <option value="unvalidated">Needs validation</option>
   </select>
   <button id="nextOpen" title="Next slide that needs review (N)">Next to review</button>
   <span id="final"></span>
@@ -141,7 +142,8 @@ function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add
 
 function visibleRows() {
   return data.slides.map((s, i) => [s, i]).filter(([s]) =>
-    filter === "all" ? true : filter === "open" ? needsReview(s) : s.status === filter);
+    filter === "all" ? true : filter === "open" ? needsReview(s)
+    : filter === "unvalidated" ? !s.hidden && !s.validated : s.status === filter);
 }
 
 function renderHeader() {
