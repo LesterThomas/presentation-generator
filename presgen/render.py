@@ -39,8 +39,128 @@ def wav_secs(path: Path) -> float:
         return w.getnframes() / w.getframerate()
 
 
+def _tts_env() -> dict:
+    # The voice model is cached locally. Offline mode stops csm-voice contacting huggingface.co on every
+    # run, which fails behind TLS-intercepting antivirus (set HF_HUB_OFFLINE=0 to allow downloads).
+    return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", **os.environ,
+            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
+class VoiceWorker:
+    """A long-lived `csm-voice --worker` process, so the voice model is loaded once, not for every slide.
+
+    Jobs go to its stdin as JSON lines; it answers with "@@READY", "@@DONE" or "@@ERROR" lines on
+    stdout. Its log (stderr) is drained on a thread, so the pipe never fills, and the last lines are
+    kept for error reports.
+    """
+
+    def __init__(self, args: list):
+        import collections
+        import threading
+        self.args, self.tail = args, collections.deque(maxlen=40)
+        log.info("Starting the voice worker (the model stays loaded between slides)")
+        t0 = time.time()
+        self.proc = subprocess.Popen(args + ["--worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                     bufsize=1, env=_tts_env())
+        threading.Thread(target=self._drain, daemon=True, name="voice-worker-log").start()
+        ready = self._answer()
+        if not ready or ready[0] != "READY":
+            self.close()
+            raise RuntimeError("voice worker did not start: " + " | ".join(list(self.tail)[-3:]))
+        log.info(f"Voice worker ready in {time.time() - t0:.0f}s (model load {ready[1].get('load_secs')}s)")
+
+    def _drain(self):
+        for line in self.proc.stderr:
+            self.tail.append(line.rstrip())
+
+    def _answer(self):
+        for line in self.proc.stdout:
+            if line.startswith("@@"):
+                kind, _, rest = line[2:].strip().partition(" ")
+                return kind, json.loads(rest or "{}")
+        return None  # the worker exited
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def run(self, text: Path, audio: Path, seed=None):
+        """Voice one text file. Returns (ok, info)."""
+        job = {"file": str(text.resolve()), "output": str(audio.resolve())}
+        if seed is not None:
+            job["seed"] = seed
+        try:
+            self.proc.stdin.write(json.dumps(job) + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            return False, {"error": "voice worker has exited"}
+        ans = self._answer()
+        if ans is None:
+            return False, {"error": "voice worker exited: " + " | ".join(list(self.tail)[-3:])}
+        return ans[0] == "DONE", ans[1]
+
+    def close(self):
+        if self.alive():
+            try:
+                self.proc.stdin.write('{"quit": true}\n')
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=10)
+            except Exception:
+                self.proc.kill()
+
+
+_workers: dict = {}
+
+
+def _worker_args(tts_cmd: str):
+    """For a csm-voice command line, the worker's arguments and the job's seed; otherwise (None, None).
+
+    The text and audio placeholders are dropped (they become per-job fields), and so is --seed (a
+    re-voice passes a new seed per job). Set PRESGEN_VOICE_WORKER=0 to always run one process per slide.
+    """
+    import shlex
+    if os.environ.get("PRESGEN_VOICE_WORKER", "1") == "0" or "csm-voice" not in tts_cmd:
+        return None, None
+    parts = [p.strip('"') for p in shlex.split(tts_cmd, posix=False)]
+    args, seed, i = [], None, 0
+    while i < len(parts):
+        p = parts[i]
+        if p in ("-f", "--file", "-o", "--output") and i + 1 < len(parts) and parts[i + 1] in ("{text}", "{audio}"):
+            i += 2
+            continue
+        if p == "--seed" and i + 1 < len(parts):
+            seed, i = int(parts[i + 1]), i + 2
+            continue
+        args.append(p)
+        i += 1
+    return args, seed
+
+
+def _voice_worker(args: list):
+    key = tuple(args)
+    w = _workers.get(key)
+    if w is None or not w.alive():
+        w = _workers[key] = VoiceWorker(args)
+    return w
+
+
+def close_voice_workers():
+    for w in _workers.values():
+        w.close()
+    _workers.clear()
+
+
+import atexit  # noqa: E402
+
+atexit.register(close_voice_workers)
+
+
 def synthesize(out: Path, slide, tts_cmd: str, retries: int = 3, force: bool = False):
-    """Make audio_NN.wav from text_NN.txt. Reused while it is newer than the text. Returns the path or None."""
+    """Make audio_NN.wav from text_NN.txt. Reused while it is newer than the text. Returns the path or None.
+
+    A csm-voice command runs in a persistent worker (the model loads once); any other command, or a
+    worker that can't start, runs as one process per slide.
+    """
     text = out / f"text_{slide.stem}.txt"
     audio = out / f"audio_{slide.stem}.wav"
     if not slide.notes.strip():
@@ -51,16 +171,25 @@ def synthesize(out: Path, slide, tts_cmd: str, retries: int = 3, force: bool = F
     if audio.exists() and audio.stat().st_mtime > text.stat().st_mtime:
         log.info(f"Slide {slide.number}: narration up to date")
         return audio
-    # The voice model is cached locally. Offline mode stops csm-voice contacting huggingface.co on every
-    # run, which fails behind TLS-intercepting antivirus (set HF_HUB_OFFLINE=0 to allow downloads).
-    env = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", **os.environ,
-           "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    wargs, seed = _worker_args(tts_cmd)
     cmd = tts_cmd.format(text=text.name, audio=audio.name)
     for attempt in range(1, retries + 1):
         log.info(f"Slide {slide.number}: generating narration (attempt {attempt}/{retries})")
         t0 = time.time()
+        if wargs is not None:
+            try:
+                ok, info = _voice_worker(wargs).run(text, audio, seed)
+            except Exception as e:  # the worker couldn't start: fall back to one process per slide
+                log.warning(f"Voice worker unavailable ({e}); running csm-voice once per slide")
+                wargs = None
+            else:
+                if ok and audio.exists():
+                    log.info(f"Slide {slide.number}: {wav_secs(audio):.1f}s of narration in {time.time() - t0:.0f}s (worker)")
+                    return audio
+                log.warning(f"Slide {slide.number}: TTS failed in the voice worker: {info.get('error')}")
+                continue
         r = subprocess.run(cmd, cwd=str(out), capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", env=env)
+                           errors="replace", env=_tts_env())
         if r.returncode == 0 and audio.exists():
             log.info(f"Slide {slide.number}: {wav_secs(audio):.1f}s of narration in {time.time() - t0:.0f}s")
             return audio

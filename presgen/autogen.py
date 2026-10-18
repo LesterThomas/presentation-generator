@@ -41,6 +41,9 @@ class AutoGenerator(threading.Thread):
             self.failed_fp.pop(stem, None)
             if revoice:
                 self.revoice.add(stem)
+            # Show the request on the page at once, even while another slide is being narrated.
+            if self.jobs.get(stem, {}).get("state") not in ("narrating", "rendering"):
+                self.jobs[stem] = {"state": "queued", "at": time.strftime("%H:%M:%S")}
         self.poke()
 
     def snapshot(self) -> dict:
@@ -80,6 +83,8 @@ class AutoGenerator(threading.Thread):
                 failed = self.failed_fp.get(s.stem) == s.fingerprint
             if again or (not failed and not pipeline.clip_current(out, manifest, s)):
                 todo.append(s)
+        with self.lock:  # slides the user asked to re-voice go first
+            todo.sort(key=lambda s: s.stem not in self.revoice)
         return out, slides, state, todo
 
     def _reconcile(self) -> None:
@@ -88,7 +93,14 @@ class AutoGenerator(threading.Thread):
             if self.jobs.get(s.stem, {}).get("state") != "failed":
                 self._set(s.stem, "queued")
         did = False
-        for s in todo:
+        for i, s in enumerate(todo):
+            with self.lock:
+                jump = i > 0 and bool(self.revoice - {x.stem for x in todo[:i]})
+            if jump:
+                # A re-voice was requested while this pass was running: start a new pass, so it goes
+                # next instead of waiting for every slide queued before it.
+                self.poke()
+                break
             current = {x.slide_id: x for x in load_slides(out)}.get(s.slide_id)
             if current is None or current.fingerprint != s.fingerprint or not ReviewState(self.pptx).is_approved(current):
                 self._set(s.stem, None)  # changed or un-approved while waiting
