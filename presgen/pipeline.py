@@ -110,6 +110,19 @@ def render_slides(pptx: Path, slides: list, opts: Options, redo_audio=frozenset(
             audio[s.number] = None
             failed.append(s)
             on_stage(s, "failed", error=str(e))
+            if getattr(e, "failed", None):
+                # The wording needs to change: ask for it on the review page, where a watcher (Claude)
+                # picks up change requests, rewords the notes and replies.
+                from .review import change_status
+                lines = [f'"{f["sentence"]}" was heard as "{f.get("transcript", "")}" '
+                         f'(missing: {" ".join(f.get("missing", [])) or "none, but extra words"})' for f in e.failed]
+                try:
+                    change_status(pptx, str(s.number), "changes",
+                                  "Narration check: after every take, the voice still could not say "
+                                  + ("this sentence. " if len(lines) == 1 else "these sentences. ")
+                                  + " ".join(lines) + " Please reword it.", by="narration check")
+                except Exception as err:  # never let the report stop the run
+                    log.warning(f"Slide {s.number}: could not post the narration check: {err}")
             continue
         if s.notes.strip() and audio[s.number] is None:  # never render a narrated slide without its narration
             failed.append(s)

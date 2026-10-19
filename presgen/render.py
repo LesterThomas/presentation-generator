@@ -84,11 +84,14 @@ class VoiceWorker:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
-    def run(self, text: Path, audio: Path, seed=None):
-        """Voice one text file. Returns (ok, info)."""
+    def run(self, text: Path, audio: Path, seed=None, context=None):
+        """Voice one text file. Returns (ok, info); info["failed"] lists sentences that failed the voice's
+        speech-to-text check. `context` (deck, slide) goes into the voice's record of every sentence."""
         job = {"file": str(text.resolve()), "output": str(audio.resolve())}
         if seed is not None:
             job["seed"] = seed
+        if context:
+            job["context"] = context
         try:
             self.proc.stdin.write(json.dumps(job) + "\n")
             self.proc.stdin.flush()
@@ -110,6 +113,16 @@ class VoiceWorker:
 
 
 _workers: dict = {}
+
+
+class TTSFailed(RuntimeError):
+    """The voice could not say some sentences of a slide: after every take, its speech-to-text check
+    still heard words missing. `failed` holds the voice's verdicts (sentence, transcript, missing words)."""
+
+    def __init__(self, slide, failed: list):
+        self.failed = failed
+        heard = " ".join(f'"{f["sentence"]}" was heard as "{f.get("transcript", "")}".' for f in failed)
+        super().__init__(f"Narration check failed on slide {slide.number}: {heard}")
 
 
 def _worker_args(tts_cmd: str):
@@ -178,13 +191,24 @@ def synthesize(out: Path, slide, tts_cmd: str, retries: int = 3, force: bool = F
         t0 = time.time()
         if wargs is not None:
             try:
-                ok, info = _voice_worker(wargs).run(text, audio, seed)
+                ok, info = _voice_worker(wargs).run(
+                    text, audio, seed, {"deck": out.name, "slide": slide.number, "stem": slide.stem})
             except Exception as e:  # the worker couldn't start: fall back to one process per slide
                 log.warning(f"Voice worker unavailable ({e}); running csm-voice once per slide")
                 wargs = None
             else:
+                if ok and audio.exists() and info.get("failed"):
+                    # Takes were already retried inside the voice; the wording is the problem. Don't render
+                    # a clip with a gap in it: report the sentences so they can be reworded.
+                    for f in info["failed"]:
+                        log.warning(f"Slide {slide.number}: narration check failed: \"{f['sentence']}\" "
+                                    f"was heard as \"{f.get('transcript', '')}\" (missing: {' '.join(f.get('missing', []))})")
+                    audio.unlink(missing_ok=True)
+                    raise TTSFailed(slide, info["failed"])
                 if ok and audio.exists():
-                    log.info(f"Slide {slide.number}: {wav_secs(audio):.1f}s of narration in {time.time() - t0:.0f}s (worker)")
+                    checked = info.get("sentences") or []
+                    note = f", {len(checked)} sentence(s) passed the speech-to-text check" if checked else ""
+                    log.info(f"Slide {slide.number}: {wav_secs(audio):.1f}s of narration in {time.time() - t0:.0f}s (worker{note})")
                     return audio
                 log.warning(f"Slide {slide.number}: TTS failed in the voice worker: {info.get('error')}")
                 continue
