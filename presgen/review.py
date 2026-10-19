@@ -7,6 +7,7 @@ approved again.
 """
 
 import json
+import os
 import logging
 import mimetypes
 import re
@@ -500,6 +501,9 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
         gen.start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://localhost:{port}/"
+    # Let the overview page (`presgen hub`) find this server.
+    marker = out / "server.json"
+    marker.write_text(json.dumps({"port": port, "pid": os.getpid(), "url": url, "started": _now()}), encoding="utf-8")
     log.info(f"Review page: {url}  (Ctrl+C to stop)")
     if open_browser:
         webbrowser.open(url)
@@ -509,3 +513,4 @@ def serve(pptx: Path, port: int = 8765, open_browser: bool = True, gen=None) -> 
         pass
     finally:
         server.server_close()
+        marker.unlink(missing_ok=True)

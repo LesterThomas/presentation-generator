@@ -1,5 +1,6 @@
 """presgen: review a narrated deck slide by slide, then turn the approved slides into a video.
 
+    uv run presgen.py hub      DECKS_DIR            # overview of every deck, with links into each review page
     uv run presgen.py review   DECK.pptx            # stills + previews, opens the review page;
                                                     # approving a slide narrates and renders it
     uv run presgen.py approve  DECK.pptx 1-4,7      # or approve on the review page
@@ -230,6 +231,12 @@ def main(argv=None) -> None:
     gen_args(sp)
     sp.set_defaults(func=cmd_review)
 
+    sp = sub.add_parser("hub", help="overview page of every deck in a folder, with links into each review page")
+    sp.add_argument("folder", type=Path, help="folder holding the decks (.pptx)")
+    sp.add_argument("--port", type=int, default=8760)
+    sp.add_argument("--no-open", action="store_true", help="don't open a browser")
+    sp.set_defaults(func=None)
+
     sp = sub.add_parser("serve", help="serve the review page again without re-inspecting the deck")
     deck_arg(sp)
     sp.add_argument("--port", type=int, default=8765)
@@ -283,6 +290,13 @@ def main(argv=None) -> None:
         sp.set_defaults(func=func)
 
     a = p.parse_args(argv)
+    if a.cmd == "hub":
+        from .hub import hub
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+        if not a.folder.is_dir():
+            raise SystemExit(f"Not a folder: {a.folder}")
+        hub(a.folder, a.port, open_browser=not a.no_open)
+        return
     if not a.deck.exists() or a.deck.suffix.lower() not in (".pptx", ".ppt"):
         raise SystemExit(f"Not a PowerPoint file: {a.deck}")
     a.deck = a.deck.resolve()

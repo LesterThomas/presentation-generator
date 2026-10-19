@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video overview</title>
+<style>
+  :root {
+    --bg: #f4f5f8; --panel: #ffffff; --edge: #dfe2ea; --text: #161a23; --muted: #5f6677;
+    --accent: #2f6fed; --approved: #1f9d55; --pending: #8a90a0; --changes: #d97a00; --changed: #8b5cf6; --updated: #2f6fed;
+    --yt: #e62117;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1017; --panel: #161a23; --edge: #262c3a; --text: #e8eaf0; --muted: #9aa1b2;
+      --accent: #5b8cff; --approved: #34c374; --pending: #7d8496; --changes: #f0a03a; --changed: #a78bfa; --updated: #5b8cff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { padding: 18px 24px; background: var(--panel); border-bottom: 1px solid var(--edge); }
+  header h1 { font-size: 18px; margin: 0 0 2px; font-weight: 600; }
+  header p { margin: 0; color: var(--muted); font-size: 12px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 14px; }
+  .deck { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 16px 18px;
+          display: grid; grid-template-columns: 1fr auto; gap: 10px 20px; align-items: center; }
+  .deck h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .id { color: var(--muted); font-size: 12px; font-family: Consolas, monospace; }
+  .bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--edge); margin: 8px 0 6px; }
+  .bar span { height: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; margin-top: 6px; }
+  .tag { padding: 2px 9px; border-radius: 999px; border: 1px solid var(--edge); font-size: 12px; white-space: nowrap; }
+  .ok { color: var(--approved); border-color: var(--approved); }
+  .stale { color: var(--changes); border-color: var(--changes); }
+  .yt { color: var(--yt); border-color: var(--yt); }
+  .actions { display: flex; flex-direction: column; gap: 8px; align-items: stretch; min-width: 170px; }
+  button, a.btn { font: inherit; border-radius: 8px; border: 1px solid var(--edge); background: var(--panel); color: var(--text);
+                  padding: 7px 14px; cursor: pointer; text-decoration: none; text-align: center; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .6; cursor: progress; }
+  a { color: var(--accent); }
+  .err { color: var(--changes); font-size: 12px; }
+  @media (max-width: 640px) { .deck { grid-template-columns: 1fr; } .actions { flex-direction: row; flex-wrap: wrap; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Training videos</h1>
+  <p id="folder">Loading…</p>
+</header>
+<main id="decks"></main>
+<script>
+const COLORS = { approved: "var(--approved)", "changes-requested": "var(--changes)", changed: "var(--changed)",
+                 updated: "var(--updated)", pending: "var(--pending)" };
+const LABELS = { approved: "approved", "changes-requested": "changes requested", changed: "changed",
+                 updated: "updated", pending: "pending" };
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+function card(d) {
+  const total = d.slides || 1;
+  const bar = Object.keys(COLORS).filter((k) => d.counts[k]).map((k) =>
+    `<span style="width:${(100 * d.counts[k]) / total}%;background:${COLORS[k]}"></span>`).join("");
+  const legend = Object.keys(COLORS).filter((k) => d.counts[k]).map((k) =>
+    `<span><i style="background:${COLORS[k]}"></i>${d.counts[k]} ${LABELS[k]}</span>`).join("");
+  const f = d.final;
+  const video = !f.exists ? `<span class="tag">No final video yet</span>`
+    : `<span class="tag ${f.current ? "ok" : "stale"}">${f.current ? "Final video ready" : "Final video out of date"}${f.secs ? " · " + mmss(f.secs) : ""}</span>
+       <a href="${f.url}" target="_blank" rel="noopener">Watch</a>`;
+  const yt = d.youtube?.url
+    ? `<a class="tag yt" href="${esc(d.youtube.url)}" target="_blank" rel="noopener">YouTube · ${esc(d.youtube.visibility || "published")}</a>`
+    : "";
+  const review = d.review.running
+    ? `<button class="primary" data-open="${esc(d.id)}">Open review</button><span class="id" style="text-align:center">running · ${esc(d.review.url)}</span>`
+    : `<button class="primary" data-open="${esc(d.id)}">Start review</button>`;
+  return `<section class="deck">
+    <div>
+      <h2>${esc(d.title)}</h2>
+      <div class="id">${esc(d.id)} · ${d.slides} slides</div>
+      <div class="bar">${bar}</div>
+      <div class="legend">${legend}</div>
+      <div class="meta">${video} ${yt}</div>
+      <div class="err" id="err-${esc(d.id)}"></div>
+    </div>
+    <div class="actions">${review}</div>
+  </section>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/decks", { cache: "no-store" });
+    const data = await r.json();
+    document.getElementById("folder").textContent = `${data.decks.length} decks · ${data.folder}`;
+    document.getElementById("decks").innerHTML = data.decks.map(card).join("");
+  } catch (e) {
+    document.getElementById("folder").textContent = "Could not load the decks: " + e;
+  }
+}
+
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-open]");
+  if (!b) return;
+  const id = b.dataset.open;
+  const err = document.getElementById(`err-${id}`);
+  // Open the tab now (inside the click) so pop-up blockers allow it, then point it at the server.
+  const tab = window.open("about:blank", "_blank");
+  b.disabled = true;
+  b.textContent = "Starting…";
+  err.textContent = "";
+  try {
+    const r = await fetch(`/api/open?deck=${encodeURIComponent(id)}`, { method: "POST" });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.statusText);
+    if (tab) tab.location = body.url; else window.open(body.url, "_blank");
+  } catch (x) {
+    if (tab) tab.close();
+    err.textContent = "Could not open the review page: " + x.message;
+  }
+  load();
+});
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
