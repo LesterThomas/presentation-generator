@@ -301,7 +301,9 @@ def powerpoint_videos(work_deck: Path, jobs: list, quality: int = 100, fps: int 
                 t0 = time.time()
                 pres.CreateVideo(str(tmp.resolve()), True, max(1, round(secs)), 1080, fps, quality)
                 deadline = t0 + 120 + secs * 4
-                while pres.CreateVideoStatus in (STATUS_IN_PROGRESS, STATUS_QUEUED):
+                # Right after CreateVideo the status can still read 0 (not started) for a moment; wait
+                # through that too, or a slide that is about to queue is reported as failed.
+                while pres.CreateVideoStatus in (0, STATUS_IN_PROGRESS, STATUS_QUEUED):
                     if time.time() > deadline:
                         raise TimeoutError(f"PowerPoint took too long to render slide {slide.number}")
                     time.sleep(0.25)
